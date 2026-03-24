@@ -34,6 +34,9 @@ async def extract_text_from_pdf(file_bytes: bytes) -> dict:
         doc = fitz.open(tmp_path)
         text = ""
         
+        # Get page count before closing
+        page_count = doc.page_count
+        
         for page in doc:
             text += page.get_text("text") + "\n\n"
         
@@ -46,15 +49,16 @@ async def extract_text_from_pdf(file_bytes: bytes) -> dict:
         
         result = {
             "text": text,
-            "page_count": doc.page_count if hasattr(doc, 'page_count') else len(doc),
+            "page_count": page_count,
             "char_count": len(text)
         }
         
         logger.debug(f"PDF extraction complete: {result['page_count']} pages, {result['char_count']} chars")
         return result
         
-    except fitz.FileError as e:
-        raise ValueError(f"Invalid PDF file: {str(e)}")
+    except Exception as e:
+        logger.error(f"PDF extraction error: {str(e)}")
+        raise ValueError(f"Error processing PDF file: {str(e)}")
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.remove(tmp_path)

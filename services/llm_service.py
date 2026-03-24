@@ -25,6 +25,32 @@ CRITICAL RULES:
 6. Dates must follow this format exactly: YYYY-MM-DD. If only month+year known: YYYY-MM-01. If only year known: YYYY-01-01.
 7. For boolean fields: return true or false only — never strings like "true" or "yes".
 8. Use exact field names as given in schema — same spelling, same underscores, same case.
+9. NEVER invent or guess values for contact_number, alt_contact_number,
+email, alt_email, linkedin_url, github_url, portfolio_url, date_of_birth,
+or credential_id. If these are not clearly and explicitly written in the
+resume text, return null. Do NOT construct or guess these values from
+patterns or names.
+10. For interests[] — this field is ONLY for career domain areas like
+"Machine Learning", "Web Development", "Data Science", "Cybersecurity",
+"Cloud Computing". If the resume has a section called "INTERESTS" or
+"HOBBIES" with values like "Badminton", "Music", "Travelling", "Reading",
+"Cricket" — these are hobbies, NOT career interests. Do NOT put hobbies
+into interests[]. Instead return interests[] based only on:
+- Sections explicitly titled "Areas of Interest" or "Career Interests"
+  or "Domain Interests"
+- Inference from projects and skills (3+ ML projects = "Machine Learning")
+If no career domain interests can be found or inferred, return interests
+as an empty array [].
+11. For passing_year in school[] — if the year seems logically
+impossible (example: 10th passing year is AFTER or SAME as 12th passing
+year), return null for that passing_year instead of the impossible value.
+A student completes 10th before 12th. 10th year must always be less than
+12th year. If the resume has a typo that violates this, return null.
+12.For designation in workexp[] — only return a value if the
+designation is explicitly written directly under or next to that specific
+company entry. Do NOT infer or carry over designation from the resume
+summary paragraph or profile bio section. If designation is not directly
+written for a company, return null.
 
 INFERENCE RULES (apply when data is not directly written):
 - employment_type: if designation contains "intern" or "internship" anywhere → "Internship".

@@ -131,3 +131,12 @@ class ParseResumeResponse(BaseModel):
     """Response from /parse/resume endpoint."""
     parsed: ParsedResume
     resume_hash: str   # SHA-256 hash of resume_text
+
+
+class SaveConfirmedRequest(BaseModel):
+    """
+    Request body for /resume/save-confirmed endpoint.
+    Contains the confirmed/edited ParsedResume and resume hash.
+    """
+    resume_hash: str
+    parsed: ParsedResume
