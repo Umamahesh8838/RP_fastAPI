@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from typing import Optional, List
 
 
@@ -10,6 +10,19 @@ class SchoolItem(BaseModel):
     percentage: Optional[float] = None       # decimal e.g. 85.60
     passing_year: Optional[int] = None       # e.g. 2018
 
+    @field_validator('percentage', mode='before')
+    @classmethod
+    def clean_percentage(cls, v):
+        if isinstance(v, str):
+            v = v.replace('%', '').strip()
+            if not v:
+                return None
+            try:
+                return float(v)
+            except ValueError:
+                return None
+        return v
+
 
 class EducationItem(BaseModel):
     """One college/university education entry extracted from resume."""
@@ -20,6 +33,19 @@ class EducationItem(BaseModel):
     end_year: Optional[int] = None           # null if currently studying
     cgpa: Optional[float] = None
     percentage: Optional[float] = None       # fill only if explicitly stated
+
+    @field_validator('cgpa', 'percentage', mode='before')
+    @classmethod
+    def clean_floats(cls, v):
+        if isinstance(v, str):
+            v = v.replace('%', '').strip()
+            if not v:
+                return None
+            try:
+                return float(v)
+            except ValueError:
+                return None
+        return v
 
 
 class WorkExpItem(BaseModel):

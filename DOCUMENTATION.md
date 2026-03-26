@@ -4,6 +4,8 @@
 **Last Updated**: March 21, 2026  
 **Version**: 2.0 (DOCX Support + Ollama Integration)
 
+> **Note:** All project docs have been consolidated into this single file. The previous Markdown files (`README.md`, `QUICK_START.md`, `QUICK_REFERENCE.md`, `TESTING_GUIDE*.md`, `README_NEW_ENDPOINTS.md`, `TWO_STEP_UPLOAD_IMPLEMENTATION.md`, `IMPLEMENTATION_*.md`, `STATUS_READY.md`, `SETUP.md`, `START_HERE.md`, `COMPLETION_REPORT.md`, `prd.md`) were removed to reduce clutter. This document now serves as the sole reference.
+
 ---
 
 ## Table of Contents

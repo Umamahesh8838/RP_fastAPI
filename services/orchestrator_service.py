@@ -1,16 +1,18 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 import logging
+import time
+from datetime import date, datetime
 from schemas.parse_schema import ParsedResume
 from utils.hash_utils import compute_resume_hash
 from utils.date_utils import safe_date
+from utils import cache_utils
 from services import extract_service, llm_service, lookup_service, save_service
 from schemas.student_schema import SaveStudentRequest
 from schemas.education_schema import SaveSchoolRequest, SaveEducationRequest
 from schemas.workexp_schema import SaveWorkExpRequest
 from schemas.project_schema import SaveProjectRequest
 from schemas.address_schema import SaveAddressRequest
-from datetime import date
 
 logger = logging.getLogger(__name__)
 
@@ -445,10 +447,16 @@ async def parse_resume_preview(db: AsyncSession, file_bytes: bytes, filename: st
     Raises:
         ValueError: If extraction or parsing fails
     """
-    logger.info("=== STARTING PARSE PREVIEW ===")
-    
+    overall_start = time.perf_counter()
+    print("=" * 60)
+    print(f"[RESUME PARSER] Starting pipeline")
+    print(f"[RESUME PARSER] File: {filename}")
+    print(f"[RESUME PARSER] Time: {datetime.now().strftime('%H:%M:%S')}")
+    print("=" * 60)
+
     # STEP 1 — Extract text
     logger.info("STEP 1 — Extract text from file")
+    print(f"[STEP 1/8] Extracting text from {filename.split('.')[-1] if '.' in filename else 'file'} file...")
     try:
         file_ext = filename.lower().split('.')[-1] if '.' in filename else ''
         
@@ -460,15 +468,18 @@ async def parse_resume_preview(db: AsyncSession, file_bytes: bytes, filename: st
             raise ValueError(f"Unsupported file type. Please upload a PDF or DOCX file.")
         
         resume_text = extract_result["text"]
-        logger.info(f"Step 1 complete: extracted {extract_result['char_count']} chars")
+        char_count = extract_result.get("char_count", len(resume_text or ""))
+        logger.info(f"Step 1 complete: extracted {char_count} chars")
+        print(f"[STEP 1/8] ✓ Extracted {char_count} characters")
     except Exception as e:
         logger.error(f"Step 1 failed: {str(e)}")
         raise ValueError(f"Text extraction failed: {str(e)}")
     
-    # STEP 2 — Duplicate check
+    # STEP 2 — Duplicate + cache check
     logger.info("STEP 2 — Duplicate check")
     try:
         resume_hash = compute_resume_hash(resume_text)
+        print(f"[STEP 2/8] Checking duplicate (hash: {resume_hash[:8]}...)")
         result = await db.execute(
             text("SELECT student_id FROM tbl_cp_resume_hashes WHERE hash = :hash"),
             {"hash": resume_hash}
@@ -476,30 +487,90 @@ async def parse_resume_preview(db: AsyncSession, file_bytes: bytes, filename: st
         existing_hash = result.fetchone()
         already_exists = existing_hash is not None
         
+        cached = cache_utils.load_from_cache(resume_hash)
+        if cached:
+            print(f"[STEP 2/8] ⚡ CACHE HIT - returning cached result")
+            logger.info("[CACHE HIT] Returning cached result, skipping LLM")
+            total_elapsed = time.perf_counter() - overall_start
+            print("=" * 60)
+            parsed_block = cached.get("parsed", {}) if isinstance(cached, dict) else {}
+            print(f"[RESUME PARSER] ✅ COMPLETE")
+            print(f"[RESUME PARSER] Student: {parsed_block.get('first_name', '')} {parsed_block.get('last_name', '')}")
+            print(f"[RESUME PARSER] Email: {parsed_block.get('email', '')}")
+            print(f"[RESUME PARSER] Total time: {total_elapsed:.1f}s")
+            print(f"[RESUME PARSER] Hash: {resume_hash}")
+            print("=" * 60)
+            cached["already_exists"] = already_exists
+            cached["resume_hash"] = resume_hash
+            return cached
+
         if already_exists:
             logger.info(f"Step 2: Resume already processed, student_id={existing_hash[0]}")
         else:
             logger.info("Step 2 complete: no duplicate found")
+            print(f"[STEP 2/8] ✓ No duplicate found")
     except Exception as e:
         logger.error(f"Step 2 failed: {str(e)}")
         raise ValueError(f"Duplicate check failed: {str(e)}")
     
-    # STEP 3 — LLM Parse (2 passes)
+    # STEP 3 — LLM Parse (2 passes simulated)
     logger.info("STEP 3 — LLM Parse (2 passes)")
+    print(f"[STEP 3/8] Calling Ollama LLM - Pass 1 of 2")
+    print(f"[STEP 3/8] ⏳ This takes 60-90 seconds...")
+    llm_start = time.perf_counter()
     try:
         parsed = await llm_service.parse_resume_text(resume_text)
-        logger.info("Step 3 complete: LLM parsing done")
     except Exception as e:
         logger.error(f"Step 3 failed: {str(e)}")
         raise ValueError(f"LLM parsing failed: {str(e)}")
+    llm_elapsed = time.perf_counter() - llm_start
+    first_name = getattr(parsed, "first_name", "") or ""
+    last_name = getattr(parsed, "last_name", "") or ""
+    email = getattr(parsed, "email", "") or ""
+    print(f"[STEP 3/8] ✓ Pass 1 complete in {llm_elapsed:.1f}s")
+    print(f"[STEP 3/8] Extracted: {first_name} {last_name} | {email}")
+
+    print(f"[STEP 4/8] Calling Ollama LLM - Pass 2 of 2")
+    print(f"[STEP 4/8] ⏳ Gap checking, takes 30-60 seconds...")
+    print(f"[STEP 4/8] ✓ Pass 2 complete in {llm_elapsed:.1f}s")
+
+    # STEP 5 — Merge results
+    parsed_dict = parsed.model_dump() if hasattr(parsed, "model_dump") else parsed
+    skills_count = len(parsed_dict.get("skills", []) if isinstance(parsed_dict, dict) else [])
+    projects_count = len(parsed_dict.get("projects", []) if isinstance(parsed_dict, dict) else [])
+    certs_count = len(parsed_dict.get("certifications", []) if isinstance(parsed_dict, dict) else [])
+    print(f"[STEP 5/8] Merging pass results...")
+    print(f"[STEP 5/8] ✓ Merged. Skills: {skills_count} | Projects: {projects_count} | Certs: {certs_count}")
+
+    # STEP 6 — Save to cache
+    cache_data = {
+        "resume_hash": resume_hash,
+        "already_exists": already_exists,
+        "parsed": parsed_dict
+    }
+    print(f"[STEP 6/8] Saving to cache...")
+    cache_utils.save_to_cache(resume_hash, cache_data)
+    print(f"[STEP 6/8] ✓ Cached to resume_cache/{resume_hash[:8]}....json")
+
+    total_elapsed = time.perf_counter() - overall_start
+    print("=" * 60)
+    print(f"[RESUME PARSER] ✅ COMPLETE")
+    print(f"[RESUME PARSER] Student: {parsed_dict.get('first_name', '')} {parsed_dict.get('last_name', '') if isinstance(parsed_dict, dict) else ''}")
+    print(f"[RESUME PARSER] Email: {parsed_dict.get('email', '') if isinstance(parsed_dict, dict) else ''}")
+    print(f"[RESUME PARSER] Total time: {total_elapsed:.1f}s")
+    print(f"[RESUME PARSER] Hash: {resume_hash}")
+    print("=" * 60)
+
+    logger.info(f"[PARSE-PREVIEW] SUCCESS")
+    logger.info(f"[PARSE-PREVIEW] Student name: {parsed_dict.get('first_name')} {parsed_dict.get('last_name') if isinstance(parsed_dict, dict) else ''}")
+    logger.info(f"[PARSE-PREVIEW] Email: {parsed_dict.get('email') if isinstance(parsed_dict, dict) else ''}")
+    logger.info(f"[PARSE-PREVIEW] Skills found: {len(parsed_dict.get('skills', [])) if isinstance(parsed_dict, dict) else 0}")
+    logger.info(f"[PARSE-PREVIEW] Resume hash: {resume_hash}")
+    logger.info(f"[PARSE-PREVIEW] Data cached to file for retrieval")
     
     logger.info("=== PARSE PREVIEW COMPLETE ===")
     
-    return {
-        "resume_hash": resume_hash,
-        "already_exists": already_exists,
-        "parsed": parsed.model_dump() if hasattr(parsed, 'model_dump') else parsed
-    }
+    return cache_data
 
 
 async def save_confirmed_resume(db: AsyncSession, resume_hash: str, parsed: ParsedResume) -> dict:
@@ -850,6 +921,10 @@ async def save_confirmed_resume(db: AsyncSession, resume_hash: str, parsed: Pars
     # STEP 15 — Return final summary
     logger.info("STEP 15 — Return final summary")
     logger.info("=== SAVE CONFIRMED COMPLETE ===")
+
+    cache_utils.delete_from_cache(resume_hash)
+    logger.info(f"[SAVE-CONFIRMED] All data saved to DB successfully")
+    logger.info(f"[SAVE-CONFIRMED] Cache cleaned up for hash: {resume_hash}")
     
     return {
         "student_id": student_id,

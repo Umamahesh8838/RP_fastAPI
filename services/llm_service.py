@@ -261,8 +261,8 @@ async def call_llm(system_prompt: str, user_message: str) -> dict:
     Raises:
         ValueError: If API call fails or response is not valid JSON
     """
-    logger.debug("Calling Ollama LLM (llama3.1)")
-    
+    logger.debug(f"Calling Ollama LLM (model={settings.ollama_model})")
+
     try:
         # Combine system and user messages for Ollama
         full_message = f"{system_prompt}\n\n{user_message}"
@@ -307,6 +307,70 @@ async def merge_pass1_and_pass2(pass1: dict, pass2: dict) -> dict:
     return merged
 
 
+def normalize_merged(merged: dict) -> dict:
+  """
+  Normalizes certain LLM output fields to match Pydantic schema types.
+
+  - Convert education[].cgpa from strings like '3.8/4.0' or '3.8' to float 3.8
+  - Convert projects[].skills_used entries that are objects to simple strings (skill names)
+  - Convert school[].passing_year to int if provided as string/date
+  """
+  # Normalize passing_year in school entries to int (extract 4-digit year)
+  for sch in merged.get("school", []):
+    py = sch.get("passing_year")
+    if isinstance(py, str):
+      m = re.search(r"(\d{4})", py)
+      if m:
+        try:
+          sch["passing_year"] = int(m.group(1))
+        except Exception:
+          sch["passing_year"] = None
+      else:
+        sch["passing_year"] = None
+
+  # Normalize CGPA in education entries
+  for edu in merged.get("education", []):
+    cgpa = edu.get("cgpa")
+    if isinstance(cgpa, str):
+      # Try to extract the first float (handles '3.8/4.0', '3.8', '3.8 out of 4')
+      m = re.search(r"(\d+(?:\.\d+)?)", cgpa)
+      if m:
+        try:
+          edu["cgpa"] = float(m.group(1))
+        except Exception:
+          edu["cgpa"] = None
+
+  # Normalize projects[].skills_used to be list[str]
+  for proj in merged.get("projects", []):
+    skills_used = proj.get("skills_used")
+    if isinstance(skills_used, list):
+      normalized = []
+      for s in skills_used:
+        if isinstance(s, str):
+          normalized.append(s)
+        elif isinstance(s, dict):
+          # Common keys: 'name', 'skill', 'skill_name'
+          name = s.get("name") or s.get("skill") or s.get("skill_name")
+          if isinstance(name, str):
+            normalized.append(name)
+          else:
+            # fallback: stringify the dict
+            try:
+              normalized.append(str(name))
+            except Exception:
+              continue
+        else:
+          # fallback for unexpected types
+          try:
+            normalized.append(str(s))
+          except Exception:
+            continue
+
+      proj["skills_used"] = normalized
+
+  return merged
+
+
 async def parse_resume_text(resume_text: str) -> ParsedResume:
     """
     Full two-pass LLM extraction pipeline.
@@ -344,6 +408,8 @@ async def parse_resume_text(resume_text: str) -> ParsedResume:
     
     # Merge results (pass2 is more authoritative)
     merged = await merge_pass1_and_pass2(pass1_result, pass2_result)
+    # Normalize fields that may come in wrong types from LLM
+    merged = normalize_merged(merged)
     
     # Validate required fields
     if not merged.get('first_name'):

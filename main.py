@@ -42,18 +42,28 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Resume Parser API",
-    description="Automatically fills campus5 database from resume files using LLM parsing.",
+    description="Automatically fills campus5 database from resume files using LLM parsing.",        
     version="1.0.0",
     lifespan=lifespan
 )
 
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    from fastapi.responses import Response
+    return Response(status_code=204)
+
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins (change to specific URLs in production)
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:8080",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:8080",
+    ],
     allow_credentials=True,
-    allow_methods=["*"],  # Allow all HTTP methods
-    allow_headers=["*"],  # Allow all headers
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
 )
 
 # Register routers

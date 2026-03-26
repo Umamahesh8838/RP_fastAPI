@@ -11,8 +11,10 @@ class Settings(BaseSettings):
     claude_max_tokens: int = 4096
     claude_temperature: float = 0.0
 
-    # Ollama Local LLM
-    ollama_model: str = "llama3.1"
+    # Ollama model (can be local or cloud-qualified name)
+    # To use cloud-hosted model set this to the cloud-qualified model name, e.g. "minimax-m2.7:cloud"
+    ollama_model: str = "minimax-m2.7:cloud"
+    # Base URL for Ollama-compatible API (keep as localhost when using local server)
     ollama_base_url: str = "http://localhost:11434"
 
     # MySQL
