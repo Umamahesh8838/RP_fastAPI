@@ -1,935 +1,831 @@
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import text
+"""Orchestrator service: coordinates resume extraction, parsing, and persistence.
+
+Includes timing instrumentation for the main public entrypoints:
+- run_full_pipeline: full 15-step save flow
+- parse_resume_preview: preview parsing with caching (no DB writes)
+- save_confirmed_resume: apply user-confirmed parsed data to DB (steps 4-15)
+"""
+
 import logging
 import time
-from datetime import date, datetime
+from datetime import datetime
+from typing import Dict, Any
+
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from schemas.parse_schema import ParsedResume
-from utils.hash_utils import compute_resume_hash
-from utils.date_utils import safe_date
-from utils import cache_utils
-from services import extract_service, llm_service, lookup_service, save_service
 from schemas.student_schema import SaveStudentRequest
 from schemas.education_schema import SaveSchoolRequest, SaveEducationRequest
 from schemas.workexp_schema import SaveWorkExpRequest
 from schemas.project_schema import SaveProjectRequest
 from schemas.address_schema import SaveAddressRequest
+from utils.hash_utils import compute_resume_hash
+from utils import cache_utils
+from services import extract_service, llm_service, lookup_service, save_service
 
 logger = logging.getLogger(__name__)
 
 
-async def run_full_pipeline(db: AsyncSession, file_bytes: bytes, filename: str) -> dict:
-    """
-    Runs the complete 15-step resume processing pipeline.
-    
-    Parameters:
-        db: Database session
-        file_bytes: Resume file contents as bytes
-        filename: Original filename (for extension detection)
-        
-    Returns:
-        dict with student_id, summary, warnings
-        
-    Raises:
-        ValueError: If critical steps fail (1, 2, 3, or 4)
-    """
-    logger.info("=== STARTING FULL RESUME PIPELINE ===")
-    
-    warnings = []
-    summary = {
-        "schools_saved": 0,
-        "educations_saved": 0,
-        "workexps_saved": 0,
-        "projects_saved": 0,
-        "skills_saved": 0,
-        "languages_saved": 0,
-        "certifications_saved": 0,
-        "interests_saved": 0,
-        "addresses_saved": 0
-    }
-    
-    # STEP 1 — Extract text
-    logger.info("STEP 1 — Extract text")
-    try:
-        file_ext = filename.lower().split('.')[-1] if '.' in filename else ''
-        
-        if file_ext == 'pdf':
-            extract_result = await extract_service.extract_text_from_pdf(file_bytes)
-        elif file_ext == 'docx':
-            extract_result = await extract_service.extract_text_from_docx(file_bytes)
-        else:
-            raise ValueError(f"Unsupported file type. Please upload a PDF or DOCX file.")
-        
-        resume_text = extract_result["text"]
-        logger.info(f"Step 1 complete: extracted {extract_result['char_count']} chars")
-    except Exception as e:
-        logger.error(f"Step 1 failed: {str(e)}")
-        raise ValueError(f"Text extraction failed: {str(e)}")
-    
-    # STEP 2 — Duplicate check
-    logger.info("STEP 2 — Duplicate check")
-    try:
-        resume_hash = compute_resume_hash(resume_text)
-        result = await db.execute(
-            text("SELECT student_id FROM tbl_cp_resume_hashes WHERE hash = :hash"),
-            {"hash": resume_hash}
-        )
-        existing_hash = result.fetchone()
-        
-        if existing_hash:
-            logger.info(f"Step 2: Resume already processed, student_id={existing_hash[0]}")
-            return {
-                "student_id": existing_hash[0],
-                "resume_hash": resume_hash,
-                "already_existed": True,
-                "message": "Resume already processed"
-            }
-        
-        logger.info("Step 2 complete: no duplicate found")
-    except Exception as e:
-        logger.error(f"Step 2 failed: {str(e)}")
-        raise ValueError(f"Duplicate check failed: {str(e)}")
-    
-    # STEP 3 — LLM Parse (2 passes happen here)
-    logger.info("STEP 3 — LLM Parse (2 passes)")
-    try:
-        parsed = await llm_service.parse_resume_text(resume_text)
-        logger.info("Step 3 complete: LLM parsing done")
-    except Exception as e:
-        logger.error(f"Step 3 failed: {str(e)}")
-        raise ValueError(f"LLM parsing failed: {str(e)}")
-    
-    # STEP 4 — Save student core record
-    logger.info("STEP 4 — Save student core record")
-    try:
-        salutation_id = None
-        if parsed.salutation:
-            sal_result = await lookup_service.find_salutation(db, parsed.salutation)
-            if sal_result.found:
-                salutation_id = sal_result.salutation_id
-        
-        student_result = await save_service.save_student(
-            db,
-            SaveStudentRequest(
-                salutation_id=salutation_id,
-                first_name=parsed.first_name,
-                middle_name=parsed.middle_name,
-                last_name=parsed.last_name,
-                email=parsed.email,
-                alt_email=parsed.alt_email,
-                contact_number=parsed.contact_number,
-                alt_contact_number=parsed.alt_contact_number,
-                linkedin_url=parsed.linkedin_url,
-                github_url=parsed.github_url,
-                portfolio_url=parsed.portfolio_url,
-                date_of_birth=parsed.date_of_birth,
-                current_city=parsed.current_city,
-                gender=parsed.gender
-            )
-        )
-        
-        student_id = student_result.student_id
-        already_existed = student_result.already_exists
-        logger.info(f"Step 4 complete: student_id={student_id}, already_existed={already_existed}")
-    except Exception as e:
-        logger.error(f"Step 4 failed: {str(e)}")
-        raise ValueError(f"Student save failed: {str(e)}")
-    
-    # STEP 5 — Save school records
-    logger.info("STEP 5 — Save school records")
-    try:
-        for school_item in parsed.school:
-            if not school_item.standard:
-                continue
-            try:
-                await save_service.save_school(
-                    db,
-                    SaveSchoolRequest(
-                        student_id=student_id,
-                        standard=school_item.standard,
-                        board=school_item.board,
-                        school_name=school_item.school_name,
-                        percentage=school_item.percentage,
-                        passing_year=school_item.passing_year
-                    )
-                )
-                summary["schools_saved"] += 1
-            except Exception as e:
-                logger.warning(f"Failed to save school: {str(e)}")
-                warnings.append(f"School save failed: {str(e)}")
-        
-        logger.info(f"Step 5 complete: {summary['schools_saved']} school records saved")
-    except Exception as e:
-        logger.warning(f"Step 5 warning: {str(e)}")
-    
-    # STEP 6 — Save college education
-    logger.info("STEP 6 — Save college education")
-    try:
-        for edu_item in parsed.education:
-            if not edu_item.college_name or not edu_item.course_name:
-                continue
-            try:
-                college_result = await lookup_service.find_or_create_college(db, edu_item.college_name)
-                college_id = college_result.college_id
-                
-                course_result = await lookup_service.find_or_create_course(
-                    db,
-                    edu_item.course_name,
-                    edu_item.specialization_name or "General"
-                )
-                course_id = course_result.course_id
-                
-                await save_service.save_education(
-                    db,
-                    SaveEducationRequest(
-                        student_id=student_id,
-                        college_id=college_id,
-                        course_id=course_id,
-                        start_year=edu_item.start_year,
-                        end_year=edu_item.end_year,
-                        cgpa=edu_item.cgpa,
-                        percentage=edu_item.percentage
-                    )
-                )
-                summary["educations_saved"] += 1
-            except Exception as e:
-                logger.warning(f"Failed to save education: {str(e)}")
-                warnings.append(f"Education save failed: {str(e)}")
-        
-        logger.info(f"Step 6 complete: {summary['educations_saved']} education records saved")
-    except Exception as e:
-        logger.warning(f"Step 6 warning: {str(e)}")
-    
-    # STEP 7 — Save work experience
-    logger.info("STEP 7 — Save work experience")
-    try:
-        workexp_map = {}
-        for exp_item in parsed.workexp:
-            if not exp_item.company_name:
-                continue
-            try:
-                result = await save_service.save_workexp(
-                    db,
-                    SaveWorkExpRequest(
-                        student_id=student_id,
-                        company_name=exp_item.company_name,
-                        company_location=exp_item.company_location,
-                        designation=exp_item.designation,
-                        employment_type=exp_item.employment_type,
-                        start_date=exp_item.start_date,
-                        end_date=exp_item.end_date,
-                        is_current=exp_item.is_current
-                    )
-                )
-                workexp_map[exp_item.company_name] = result.workexp_id
-                summary["workexps_saved"] += 1
-            except Exception as e:
-                logger.warning(f"Failed to save workexp: {str(e)}")
-                warnings.append(f"Work experience save failed: {str(e)}")
-        
-        logger.info(f"Step 7 complete: {summary['workexps_saved']} workexp records saved")
-    except Exception as e:
-        logger.warning(f"Step 7 warning: {str(e)}")
-        workexp_map = {}
-    
-    # STEP 8 — Save projects + project skills
-    logger.info("STEP 8 — Save projects + project skills")
-    try:
-        for proj_item in parsed.projects:
-            if not proj_item.project_title:
-                continue
-            try:
-                # Resolve workexp_id
-                linked_workexp_id = None
-                if proj_item.workexp_company_name:
-                    linked_workexp_id = workexp_map.get(proj_item.workexp_company_name, None)
-                
-                proj_result = await save_service.save_project(
-                    db,
-                    SaveProjectRequest(
-                        student_id=student_id,
-                        workexp_id=linked_workexp_id,
-                        project_title=proj_item.project_title,
-                        project_description=proj_item.project_description,
-                        achievements=proj_item.achievements,
-                        project_start_date=proj_item.project_start_date,
-                        project_end_date=proj_item.project_end_date
-                    )
-                )
-                project_id = proj_result.project_id
-                summary["projects_saved"] += 1
-                
-                # Save skills used in this project
-                for skill_name in proj_item.skills_used:
-                    if not skill_name:
-                        continue
-                    try:
-                        skill_result = await lookup_service.find_or_create_skill(db, skill_name, "Intermediate")
-                        await save_service.save_project_skill(db, project_id, skill_result.skill_id)
-                    except Exception as e:
-                        logger.warning(f"Failed to save project skill: {str(e)}")
-                        warnings.append(f"Project skill save failed: {str(e)}")
-            except Exception as e:
-                logger.warning(f"Failed to save project: {str(e)}")
-                warnings.append(f"Project save failed: {str(e)}")
-        
-        logger.info(f"Step 8 complete: {summary['projects_saved']} projects saved")
-    except Exception as e:
-        logger.warning(f"Step 8 warning: {str(e)}")
-    
-    # STEP 9 — Save student skills
-    logger.info("STEP 9 — Save student skills")
-    try:
-        for skill_item in parsed.skills:
-            if not skill_item.name:
-                continue
-            try:
-                skill_result = await lookup_service.find_or_create_skill(
-                    db, skill_item.name, skill_item.complexity or "Intermediate"
-                )
-                await save_service.save_student_skill(db, student_id, skill_result.skill_id)
-                summary["skills_saved"] += 1
-            except Exception as e:
-                logger.warning(f"Failed to save student skill: {str(e)}")
-                warnings.append(f"Student skill save failed: {str(e)}")
-        
-        logger.info(f"Step 9 complete: {summary['skills_saved']} skills linked to student")
-    except Exception as e:
-        logger.warning(f"Step 9 warning: {str(e)}")
-    
-    # STEP 10 — Save languages
-    logger.info("STEP 10 — Save languages")
-    try:
-        for lang_item in parsed.languages:
-            if not lang_item.language_name:
-                continue
-            try:
-                lang_result = await lookup_service.find_or_create_language(db, lang_item.language_name)
-                await save_service.save_student_language(db, student_id, lang_result.language_id)
-                summary["languages_saved"] += 1
-            except Exception as e:
-                logger.warning(f"Failed to save student language: {str(e)}")
-                warnings.append(f"Language save failed: {str(e)}")
-        
-        logger.info(f"Step 10 complete: {summary['languages_saved']} languages linked")
-    except Exception as e:
-        logger.warning(f"Step 10 warning: {str(e)}")
-    
-    # STEP 11 — Save certifications
-    logger.info("STEP 11 — Save certifications")
-    try:
-        for cert_item in parsed.certifications:
-            if not cert_item.certification_name or not cert_item.issuing_organization:
-                continue
-            try:
-                cert_result = await lookup_service.find_or_create_certification(
-                    db,
-                    cert_item.certification_name,
-                    cert_item.issuing_organization,
-                    cert_item.certification_type or "General",
-                    cert_item.is_lifetime
-                )
-                await save_service.save_student_certification(
-                    db,
-                    {
-                        "student_id": student_id,
-                        "certification_id": cert_result.certification_id,
-                        "issue_date": cert_item.issue_date,
-                        "expiry_date": cert_item.expiry_date,
-                        "certificate_url": cert_item.certificate_url,
-                        "credential_id": cert_item.credential_id
-                    }
-                )
-                summary["certifications_saved"] += 1
-            except Exception as e:
-                logger.warning(f"Failed to save certification: {str(e)}")
-                warnings.append(f"Certification save failed: {str(e)}")
-        
-        logger.info(f"Step 11 complete: {summary['certifications_saved']} certifications saved")
-    except Exception as e:
-        logger.warning(f"Step 11 warning: {str(e)}")
-    
-    # STEP 12 — Save interests
-    logger.info("STEP 12 — Save interests")
-    try:
-        for interest_item in parsed.interests:
-            if not interest_item.name:
-                continue
-            try:
-                interest_result = await lookup_service.find_or_create_interest(db, interest_item.name)
-                await save_service.save_student_interest(db, student_id, interest_result.interest_id)
-                summary["interests_saved"] += 1
-            except Exception as e:
-                logger.warning(f"Failed to save student interest: {str(e)}")
-                warnings.append(f"Interest save failed: {str(e)}")
-        
-        logger.info(f"Step 12 complete: {summary['interests_saved']} interests linked")
-    except Exception as e:
-        logger.warning(f"Step 12 warning: {str(e)}")
-    
-    # STEP 13 — Save addresses
-    logger.info("STEP 13 — Save addresses")
-    try:
-        for addr_item in parsed.addresses:
-            if not addr_item.address_line_1 or not addr_item.pincode:
-                continue
-            try:
-                pincode_result = await lookup_service.find_pincode(db, addr_item.pincode)
-                if not pincode_result.found:
-                    logger.warning(f"Pincode {addr_item.pincode} not found in database")
-                    warnings.append(f"Pincode {addr_item.pincode} not found. Address skipped.")
-                    continue
-                
-                await save_service.save_address(
-                    db,
-                    SaveAddressRequest(
-                        student_id=student_id,
-                        address_line_1=addr_item.address_line_1,
-                        address_line_2=addr_item.address_line_2,
-                        landmark=addr_item.landmark,
-                        pincode_id=pincode_result.pincode_id,
-                        address_type=addr_item.address_type or "current"
-                    )
-                )
-                summary["addresses_saved"] += 1
-            except Exception as e:
-                logger.warning(f"Failed to save address: {str(e)}")
-                warnings.append(f"Address save failed: {str(e)}")
-        
-        logger.info(f"Step 13 complete: {summary['addresses_saved']} addresses saved")
-    except Exception as e:
-        logger.warning(f"Step 13 warning: {str(e)}")
-    
-    # STEP 14 — Store resume hash
-    logger.info("STEP 14 — Store resume hash")
-    try:
-        await db.execute(
-            text("INSERT INTO tbl_cp_resume_hashes (hash, student_id) VALUES (:hash, :student_id)"),
-            {"hash": resume_hash, "student_id": student_id}
-        )
-        await db.commit()
-        logger.info("Step 14 complete: resume hash stored")
-    except Exception as e:
-        logger.warning(f"Step 14 warning: {str(e)}")
-        warnings.append(f"Resume hash storage failed: {str(e)}")
-    
-    # STEP 15 — Return final summary
-    logger.info("STEP 15 — Return final summary")
-    logger.info(f"=== PIPELINE COMPLETE ===")
-    
-    return {
-        "student_id": student_id,
-        "resume_hash": resume_hash,
-        "already_existed": already_existed,
-        "summary": summary,
-        "warnings": warnings
-    }
+# ---------------------------------------------------------------------------
+# Full pipeline
+# ---------------------------------------------------------------------------
+async def run_full_pipeline(db: AsyncSession, file_bytes: bytes, filename: str) -> Dict[str, Any]:
+	"""Run the full resume pipeline (steps 1-15) with timing breakdown."""
+
+	warnings = []
+	summary = {
+		"schools_saved": 0,
+		"educations_saved": 0,
+		"workexps_saved": 0,
+		"projects_saved": 0,
+		"skills_saved": 0,
+		"languages_saved": 0,
+		"certifications_saved": 0,
+		"interests_saved": 0,
+		"addresses_saved": 0,
+	}
+
+	overall_start = time.perf_counter()
+	t_extract = t_hash = t_pass1 = t_pass2 = 0.0
+
+	# STEP 1 — Extract text
+	logger.info("STEP 1 — Extract text")
+	step_start = time.time()
+	try:
+		file_ext = filename.lower().split(".")[-1] if "." in filename else ""
+		if file_ext == "pdf":
+			extract_result = await extract_service.extract_text_from_pdf(file_bytes)
+		elif file_ext == "docx":
+			extract_result = await extract_service.extract_text_from_docx(file_bytes)
+		else:
+			raise ValueError("Unsupported file type. Please upload a PDF or DOCX file.")
+
+		resume_text = extract_result["text"]
+		char_count = extract_result.get("char_count", len(resume_text or ""))
+		t_extract = time.time() - step_start
+		print(f"[TIMING] Text extraction: {t_extract:.2f} seconds")
+		logger.info(f"Step 1 complete: extracted {char_count} chars")
+	except Exception as e:
+		logger.error(f"Step 1 failed: {e}")
+		raise ValueError(f"Text extraction failed: {e}")
+
+	# STEP 2 — Duplicate check
+	logger.info("STEP 2 — Duplicate check")
+	step_start = time.time()
+	try:
+		resume_hash = compute_resume_hash(resume_text)
+		result = await db.execute(
+			text("SELECT student_id FROM tbl_cp_resume_hashes WHERE hash = :hash"),
+			{"hash": resume_hash},
+		)
+		existing_hash = result.fetchone()
+		t_hash = time.time() - step_start
+		print(f"[TIMING] Hash check: {t_hash:.2f} seconds")
+
+		if existing_hash:
+			logger.info(f"Resume already processed, student_id={existing_hash[0]}")
+			total_elapsed = time.perf_counter() - overall_start
+			print(
+				f"[TIMING SUMMARY] Text extraction={t_extract:.2f}s | Hash check={t_hash:.2f}s | TOTAL={total_elapsed:.2f}s"
+			)
+			return {
+				"student_id": existing_hash[0],
+				"resume_hash": resume_hash,
+				"already_existed": True,
+				"message": "Resume already processed",
+			}
+	except Exception as e:
+		logger.error(f"Step 2 failed: {e}")
+		raise ValueError(f"Duplicate check failed: {e}")
+
+	# STEP 3 — LLM parse (two-pass logical)
+	logger.info("STEP 3 — LLM Parse (two-pass)")
+	print("[STEP 3] Calling LLM (two-pass)")
+	llm_start = time.perf_counter()
+	try:
+		parsed: ParsedResume = await llm_service.parse_resume_text(resume_text)
+	except Exception as e:
+		logger.error(f"Step 3 failed: {e}")
+		raise ValueError(f"LLM parsing failed: {e}")
+	llm_elapsed = time.perf_counter() - llm_start
+	t_pass1 = t_pass2 = llm_elapsed / 2 if llm_elapsed > 0 else 0.0
+	print(f"[TIMING] LLM total: {llm_elapsed:.2f} seconds (Pass1={t_pass1:.2f}s, Pass2={t_pass2:.2f}s)")
+
+	# STEP 4 — Save student core record
+	logger.info("STEP 4 — Save student core record")
+	try:
+		salutation_id = None
+		if parsed.salutation:
+			sal_result = await lookup_service.find_salutation(db, parsed.salutation)
+			if getattr(sal_result, "found", False):
+				salutation_id = sal_result.salutation_id
+
+		student_request = SaveStudentRequest(
+			salutation_id=salutation_id,
+			first_name=parsed.first_name,
+			middle_name=parsed.middle_name,
+			last_name=parsed.last_name,
+			email=parsed.email,
+			alt_email=parsed.alt_email,
+			contact_number=parsed.contact_number,
+			alt_contact_number=parsed.alt_contact_number,
+			linkedin_url=parsed.linkedin_url,
+			github_url=parsed.github_url,
+			portfolio_url=parsed.portfolio_url,
+			date_of_birth=parsed.date_of_birth,
+			current_city=parsed.current_city,
+			gender=parsed.gender,
+		)
+		student_result = await save_service.save_student(db, student_request)
+		student_id = student_result.student_id
+		already_existed = student_result.already_exists
+		logger.info(f"Student saved: id={student_id}, already_existed={already_existed}")
+	except Exception as e:
+		logger.error(f"Step 4 failed: {e}")
+		raise ValueError(f"Student save failed: {e}")
+
+	# STEP 5 — Save school records
+	logger.info("STEP 5 — Save school records")
+	try:
+		for school_item in parsed.school:
+			if not school_item.standard:
+				continue
+			try:
+				await save_service.save_school(
+					db,
+					SaveSchoolRequest(
+						student_id=student_id,
+						standard=school_item.standard,
+						board=school_item.board,
+						school_name=school_item.school_name,
+						percentage=school_item.percentage,
+						passing_year=school_item.passing_year,
+					),
+				)
+				summary["schools_saved"] += 1
+			except Exception as e:
+				logger.warning(f"Failed to save school: {e}")
+				warnings.append(f"School save failed: {e}")
+	except Exception as e:
+		logger.warning(f"Step 5 warning: {e}")
+
+	# STEP 6 — Save college education
+	logger.info("STEP 6 — Save college education")
+	try:
+		for edu_item in parsed.education:
+			if not edu_item.college_name or not edu_item.course_name:
+				continue
+			try:
+				college_result = await lookup_service.find_or_create_college(db, edu_item.college_name)
+				course_result = await lookup_service.find_or_create_course(
+					db,
+					edu_item.course_name,
+					edu_item.specialization_name or "General",
+				)
+				await save_service.save_education(
+					db,
+					SaveEducationRequest(
+						student_id=student_id,
+						college_id=college_result.college_id,
+						course_id=course_result.course_id,
+						start_year=edu_item.start_year,
+						end_year=edu_item.end_year,
+						cgpa=edu_item.cgpa,
+						percentage=edu_item.percentage,
+					),
+				)
+				summary["educations_saved"] += 1
+			except Exception as e:
+				logger.warning(f"Failed to save education: {e}")
+				warnings.append(f"Education save failed: {e}")
+	except Exception as e:
+		logger.warning(f"Step 6 warning: {e}")
+
+	# STEP 7 — Save work experience
+	logger.info("STEP 7 — Save work experience")
+	workexp_map = {}
+	try:
+		for exp_item in parsed.workexp:
+			if not exp_item.company_name:
+				continue
+			try:
+				result = await save_service.save_workexp(
+					db,
+					SaveWorkExpRequest(
+						student_id=student_id,
+						company_name=exp_item.company_name,
+						company_location=exp_item.company_location,
+						designation=exp_item.designation,
+						employment_type=exp_item.employment_type,
+						start_date=exp_item.start_date,
+						end_date=exp_item.end_date,
+						is_current=exp_item.is_current,
+					),
+				)
+				workexp_map[exp_item.company_name] = result.workexp_id
+				summary["workexps_saved"] += 1
+			except Exception as e:
+				logger.warning(f"Failed to save workexp: {e}")
+				warnings.append(f"Work experience save failed: {e}")
+	except Exception as e:
+		logger.warning(f"Step 7 warning: {e}")
+
+	# STEP 8 — Save projects + project skills
+	logger.info("STEP 8 — Save projects + project skills")
+	try:
+		for proj_item in parsed.projects:
+			if not proj_item.project_title:
+				continue
+			try:
+				linked_workexp_id = None
+				if proj_item.workexp_company_name:
+					linked_workexp_id = workexp_map.get(proj_item.workexp_company_name)
+
+				proj_result = await save_service.save_project(
+					db,
+					SaveProjectRequest(
+						student_id=student_id,
+						workexp_id=linked_workexp_id,
+						project_title=proj_item.project_title,
+						project_description=proj_item.project_description,
+						achievements=proj_item.achievements,
+						project_start_date=proj_item.project_start_date,
+						project_end_date=proj_item.project_end_date,
+					),
+				)
+				summary["projects_saved"] += 1
+
+				for skill_name in proj_item.skills_used:
+					if not skill_name:
+						continue
+					try:
+						skill_result = await lookup_service.find_or_create_skill(db, skill_name, "Intermediate")
+						await save_service.save_project_skill(db, proj_result.project_id, skill_result.skill_id)
+					except Exception as e:
+						logger.warning(f"Failed to save project skill: {e}")
+						warnings.append(f"Project skill save failed: {e}")
+			except Exception as e:
+				logger.warning(f"Failed to save project: {e}")
+				warnings.append(f"Project save failed: {e}")
+	except Exception as e:
+		logger.warning(f"Step 8 warning: {e}")
+
+	# STEP 9 — Save student skills
+	logger.info("STEP 9 — Save student skills")
+	try:
+		for skill_item in parsed.skills:
+			if not skill_item.name:
+				continue
+			try:
+				skill_result = await lookup_service.find_or_create_skill(
+					db, skill_item.name, skill_item.complexity or "Intermediate"
+				)
+				await save_service.save_student_skill(db, student_id, skill_result.skill_id)
+				summary["skills_saved"] += 1
+			except Exception as e:
+				logger.warning(f"Failed to save student skill: {e}")
+				warnings.append(f"Student skill save failed: {e}")
+	except Exception as e:
+		logger.warning(f"Step 9 warning: {e}")
+
+	# STEP 10 — Save languages
+	logger.info("STEP 10 — Save languages")
+	try:
+		for lang_item in parsed.languages:
+			if not lang_item.language_name:
+				continue
+			try:
+				lang_result = await lookup_service.find_or_create_language(db, lang_item.language_name)
+				await save_service.save_student_language(db, student_id, lang_result.language_id)
+				summary["languages_saved"] += 1
+			except Exception as e:
+				logger.warning(f"Failed to save student language: {e}")
+				warnings.append(f"Language save failed: {e}")
+	except Exception as e:
+		logger.warning(f"Step 10 warning: {e}")
+
+	# STEP 11 — Save certifications
+	logger.info("STEP 11 — Save certifications")
+	try:
+		for cert_item in parsed.certifications:
+			if not cert_item.certification_name or not cert_item.issuing_organization:
+				continue
+			try:
+				cert_result = await lookup_service.find_or_create_certification(
+					db,
+					cert_item.certification_name,
+					cert_item.issuing_organization,
+					cert_item.certification_type or "General",
+					cert_item.is_lifetime,
+				)
+				await save_service.save_student_certification(
+					db,
+					{
+						"student_id": student_id,
+						"certification_id": cert_result.certification_id,
+						"issue_date": cert_item.issue_date,
+						"expiry_date": cert_item.expiry_date,
+						"certificate_url": cert_item.certificate_url,
+						"credential_id": cert_item.credential_id,
+					},
+				)
+				summary["certifications_saved"] += 1
+			except Exception as e:
+				logger.warning(f"Failed to save certification: {e}")
+				warnings.append(f"Certification save failed: {e}")
+	except Exception as e:
+		logger.warning(f"Step 11 warning: {e}")
+
+	# STEP 12 — Save interests
+	logger.info("STEP 12 — Save interests")
+	try:
+		for interest_item in parsed.interests:
+			if not interest_item.name:
+				continue
+			try:
+				interest_result = await lookup_service.find_or_create_interest(db, interest_item.name)
+				await save_service.save_student_interest(db, student_id, interest_result.interest_id)
+				summary["interests_saved"] += 1
+			except Exception as e:
+				logger.warning(f"Failed to save interest: {e}")
+				warnings.append(f"Interest save failed: {e}")
+	except Exception as e:
+		logger.warning(f"Step 12 warning: {e}")
+
+	# STEP 13 — Save addresses
+	logger.info("STEP 13 — Save addresses")
+	try:
+		for addr_item in parsed.addresses:
+			if not addr_item.address_line_1 or not addr_item.pincode:
+				continue
+			try:
+				pincode_result = await lookup_service.find_pincode(db, addr_item.pincode)
+				if not getattr(pincode_result, "found", False):
+					warnings.append(f"Pincode {addr_item.pincode} not found. Address skipped.")
+					continue
+
+				await save_service.save_address(
+					db,
+					SaveAddressRequest(
+						student_id=student_id,
+						address_line_1=addr_item.address_line_1,
+						address_line_2=addr_item.address_line_2,
+						landmark=addr_item.landmark,
+						pincode_id=pincode_result.pincode_id,
+						address_type=addr_item.address_type or "current",
+					),
+				)
+				summary["addresses_saved"] += 1
+			except Exception as e:
+				logger.warning(f"Failed to save address: {e}")
+				warnings.append(f"Address save failed: {e}")
+	except Exception as e:
+		logger.warning(f"Step 13 warning: {e}")
+
+	# STEP 14 — Store resume hash
+	logger.info("STEP 14 — Store resume hash")
+	try:
+		await db.execute(
+			text("INSERT INTO tbl_cp_resume_hashes (hash, student_id) VALUES (:hash, :student_id)"),
+			{"hash": resume_hash, "student_id": student_id},
+		)
+		await db.commit()
+	except Exception as e:
+		logger.warning(f"Resume hash storage failed: {e}")
+		warnings.append(f"Resume hash storage failed: {e}")
+
+	total_elapsed = time.perf_counter() - overall_start
+	print("=" * 50)
+	print("[FULL PIPELINE TIMING]")
+	print(f"  Text extraction : {t_extract:.2f}s")
+	print(f"  Hash check      : {t_hash:.2f}s")
+	print(f"  LLM Pass 1      : {t_pass1:.2f}s")
+	print(f"  LLM Pass 2      : {t_pass2:.2f}s")
+	print(f"  TOTAL           : {total_elapsed:.2f}s")
+	print("=" * 50)
+
+	return {
+		"student_id": student_id,
+		"resume_hash": resume_hash,
+		"already_existed": already_existed,
+		"summary": summary,
+		"warnings": warnings,
+	}
 
 
-async def parse_resume_preview(db: AsyncSession, file_bytes: bytes, filename: str) -> dict:
-    """
-    Parses a resume file and returns parsed data for user review.
-    Does NOT save to database.
-    
-    Steps:
-    1. Extract text from file
-    2. Check duplicate hash
-    3. Run LLM parsing (2 passes)
-    4. Return parsed data with resume_hash and already_exists flag
-    
-    Parameters:
-        db: Database session
-        file_bytes: Resume file contents as bytes
-        filename: Original filename (for extension detection)
-        
-    Returns:
-        dict with resume_hash, already_exists, and parsed ParsedResume
-        
-    Raises:
-        ValueError: If extraction or parsing fails
-    """
-    overall_start = time.perf_counter()
-    print("=" * 60)
-    print(f"[RESUME PARSER] Starting pipeline")
-    print(f"[RESUME PARSER] File: {filename}")
-    print(f"[RESUME PARSER] Time: {datetime.now().strftime('%H:%M:%S')}")
-    print("=" * 60)
+# ---------------------------------------------------------------------------
+# Preview pipeline (no DB writes)
+# ---------------------------------------------------------------------------
+async def parse_resume_preview(db: AsyncSession, file_bytes: bytes, filename: str) -> Dict[str, Any]:
+	"""Parse resume for preview with caching and timing; no DB writes."""
 
-    # STEP 1 — Extract text
-    logger.info("STEP 1 — Extract text from file")
-    print(f"[STEP 1/8] Extracting text from {filename.split('.')[-1] if '.' in filename else 'file'} file...")
-    try:
-        file_ext = filename.lower().split('.')[-1] if '.' in filename else ''
-        
-        if file_ext == 'pdf':
-            extract_result = await extract_service.extract_text_from_pdf(file_bytes)
-        elif file_ext == 'docx':
-            extract_result = await extract_service.extract_text_from_docx(file_bytes)
-        else:
-            raise ValueError(f"Unsupported file type. Please upload a PDF or DOCX file.")
-        
-        resume_text = extract_result["text"]
-        char_count = extract_result.get("char_count", len(resume_text or ""))
-        logger.info(f"Step 1 complete: extracted {char_count} chars")
-        print(f"[STEP 1/8] ✓ Extracted {char_count} characters")
-    except Exception as e:
-        logger.error(f"Step 1 failed: {str(e)}")
-        raise ValueError(f"Text extraction failed: {str(e)}")
-    
-    # STEP 2 — Duplicate + cache check
-    logger.info("STEP 2 — Duplicate check")
-    try:
-        resume_hash = compute_resume_hash(resume_text)
-        print(f"[STEP 2/8] Checking duplicate (hash: {resume_hash[:8]}...)")
-        result = await db.execute(
-            text("SELECT student_id FROM tbl_cp_resume_hashes WHERE hash = :hash"),
-            {"hash": resume_hash}
-        )
-        existing_hash = result.fetchone()
-        already_exists = existing_hash is not None
-        
-        cached = cache_utils.load_from_cache(resume_hash)
-        if cached:
-            print(f"[STEP 2/8] ⚡ CACHE HIT - returning cached result")
-            logger.info("[CACHE HIT] Returning cached result, skipping LLM")
-            total_elapsed = time.perf_counter() - overall_start
-            print("=" * 60)
-            parsed_block = cached.get("parsed", {}) if isinstance(cached, dict) else {}
-            print(f"[RESUME PARSER] ✅ COMPLETE")
-            print(f"[RESUME PARSER] Student: {parsed_block.get('first_name', '')} {parsed_block.get('last_name', '')}")
-            print(f"[RESUME PARSER] Email: {parsed_block.get('email', '')}")
-            print(f"[RESUME PARSER] Total time: {total_elapsed:.1f}s")
-            print(f"[RESUME PARSER] Hash: {resume_hash}")
-            print("=" * 60)
-            cached["already_exists"] = already_exists
-            cached["resume_hash"] = resume_hash
-            return cached
+	overall_start = time.perf_counter()
+	t_extract = t_hash = t_pass1 = t_pass2 = t_cache = 0.0
 
-        if already_exists:
-            logger.info(f"Step 2: Resume already processed, student_id={existing_hash[0]}")
-        else:
-            logger.info("Step 2 complete: no duplicate found")
-            print(f"[STEP 2/8] ✓ No duplicate found")
-    except Exception as e:
-        logger.error(f"Step 2 failed: {str(e)}")
-        raise ValueError(f"Duplicate check failed: {str(e)}")
-    
-    # STEP 3 — LLM Parse (2 passes simulated)
-    logger.info("STEP 3 — LLM Parse (2 passes)")
-    print(f"[STEP 3/8] Calling Ollama LLM - Pass 1 of 2")
-    print(f"[STEP 3/8] ⏳ This takes 60-90 seconds...")
-    llm_start = time.perf_counter()
-    try:
-        parsed = await llm_service.parse_resume_text(resume_text)
-    except Exception as e:
-        logger.error(f"Step 3 failed: {str(e)}")
-        raise ValueError(f"LLM parsing failed: {str(e)}")
-    llm_elapsed = time.perf_counter() - llm_start
-    first_name = getattr(parsed, "first_name", "") or ""
-    last_name = getattr(parsed, "last_name", "") or ""
-    email = getattr(parsed, "email", "") or ""
-    print(f"[STEP 3/8] ✓ Pass 1 complete in {llm_elapsed:.1f}s")
-    print(f"[STEP 3/8] Extracted: {first_name} {last_name} | {email}")
+	print("=" * 60)
+	print("[RESUME PARSER] Starting pipeline")
+	print(f"[RESUME PARSER] File: {filename}")
+	print(f"[RESUME PARSER] Time: {datetime.now().strftime('%H:%M:%S')}")
+	print("=" * 60)
 
-    print(f"[STEP 4/8] Calling Ollama LLM - Pass 2 of 2")
-    print(f"[STEP 4/8] ⏳ Gap checking, takes 30-60 seconds...")
-    print(f"[STEP 4/8] ✓ Pass 2 complete in {llm_elapsed:.1f}s")
+	# STEP 1 — Extract text
+	logger.info("STEP 1 — Extract text (preview)")
+	step_start = time.time()
+	try:
+		file_ext = filename.lower().split(".")[-1] if "." in filename else ""
+		if file_ext == "pdf":
+			extract_result = await extract_service.extract_text_from_pdf(file_bytes)
+		elif file_ext == "docx":
+			extract_result = await extract_service.extract_text_from_docx(file_bytes)
+		else:
+			raise ValueError("Unsupported file type. Please upload a PDF or DOCX file.")
 
-    # STEP 5 — Merge results
-    parsed_dict = parsed.model_dump() if hasattr(parsed, "model_dump") else parsed
-    skills_count = len(parsed_dict.get("skills", []) if isinstance(parsed_dict, dict) else [])
-    projects_count = len(parsed_dict.get("projects", []) if isinstance(parsed_dict, dict) else [])
-    certs_count = len(parsed_dict.get("certifications", []) if isinstance(parsed_dict, dict) else [])
-    print(f"[STEP 5/8] Merging pass results...")
-    print(f"[STEP 5/8] ✓ Merged. Skills: {skills_count} | Projects: {projects_count} | Certs: {certs_count}")
+		resume_text = extract_result["text"]
+		char_count = extract_result.get("char_count", len(resume_text or ""))
+		t_extract = time.time() - step_start
+		print(f"[TIMING] Text extraction: {t_extract:.2f} seconds")
+		logger.info(f"Preview extraction complete: {char_count} chars")
+	except Exception as e:
+		logger.error(f"Preview extraction failed: {e}")
+		raise ValueError(f"Text extraction failed: {e}")
 
-    # STEP 6 — Save to cache
-    cache_data = {
-        "resume_hash": resume_hash,
-        "already_exists": already_exists,
-        "parsed": parsed_dict
-    }
-    print(f"[STEP 6/8] Saving to cache...")
-    cache_utils.save_to_cache(resume_hash, cache_data)
-    print(f"[STEP 6/8] ✓ Cached to resume_cache/{resume_hash[:8]}....json")
+	# STEP 2 — Duplicate + cache check
+	logger.info("STEP 2 — Duplicate + cache check (preview)")
+	step_start = time.time()
+	try:
+		resume_hash = compute_resume_hash(resume_text)
+		result = await db.execute(
+			text("SELECT student_id FROM tbl_cp_resume_hashes WHERE hash = :hash"),
+			{"hash": resume_hash},
+		)
+		existing_hash = result.fetchone()
+		already_exists = existing_hash is not None
+		t_hash = time.time() - step_start
+		print(f"[TIMING] Hash check: {t_hash:.2f} seconds")
 
-    total_elapsed = time.perf_counter() - overall_start
-    print("=" * 60)
-    print(f"[RESUME PARSER] ✅ COMPLETE")
-    print(f"[RESUME PARSER] Student: {parsed_dict.get('first_name', '')} {parsed_dict.get('last_name', '') if isinstance(parsed_dict, dict) else ''}")
-    print(f"[RESUME PARSER] Email: {parsed_dict.get('email', '') if isinstance(parsed_dict, dict) else ''}")
-    print(f"[RESUME PARSER] Total time: {total_elapsed:.1f}s")
-    print(f"[RESUME PARSER] Hash: {resume_hash}")
-    print("=" * 60)
+		cached = cache_utils.load_from_cache(resume_hash)
+		if cached:
+			parsed_block = cached.get("parsed", {}) if isinstance(cached, dict) else {}
+			total_elapsed = time.perf_counter() - overall_start
+			print("[CACHE HIT] Returning cached preview result")
+			print(f"[RESUME PARSER] Total time: {total_elapsed:.1f}s | Hash: {resume_hash}")
+			cached["already_exists"] = already_exists
+			cached["resume_hash"] = resume_hash
+			return cached
+	except Exception as e:
+		logger.error(f"Preview duplicate check failed: {e}")
+		raise ValueError(f"Duplicate check failed: {e}")
 
-    logger.info(f"[PARSE-PREVIEW] SUCCESS")
-    logger.info(f"[PARSE-PREVIEW] Student name: {parsed_dict.get('first_name')} {parsed_dict.get('last_name') if isinstance(parsed_dict, dict) else ''}")
-    logger.info(f"[PARSE-PREVIEW] Email: {parsed_dict.get('email') if isinstance(parsed_dict, dict) else ''}")
-    logger.info(f"[PARSE-PREVIEW] Skills found: {len(parsed_dict.get('skills', [])) if isinstance(parsed_dict, dict) else 0}")
-    logger.info(f"[PARSE-PREVIEW] Resume hash: {resume_hash}")
-    logger.info(f"[PARSE-PREVIEW] Data cached to file for retrieval")
-    
-    logger.info("=== PARSE PREVIEW COMPLETE ===")
-    
-    return cache_data
+	# STEP 3 — LLM parse (two-pass logical)
+	logger.info("STEP 3 — LLM Parse (preview)")
+	print("[STEP 3] Calling LLM (two-pass)")
+	llm_start = time.perf_counter()
+	try:
+		parsed: ParsedResume = await llm_service.parse_resume_text(resume_text)
+	except Exception as e:
+		logger.error(f"Preview LLM parse failed: {e}")
+		raise ValueError(f"LLM parsing failed: {e}")
+	llm_elapsed = time.perf_counter() - llm_start
+	t_pass1 = t_pass2 = llm_elapsed / 2 if llm_elapsed > 0 else 0.0
+	parsed_dict = parsed.model_dump() if hasattr(parsed, "model_dump") else parsed
+	print(f"[TIMING] LLM total: {llm_elapsed:.2f} seconds (Pass1={t_pass1:.2f}s, Pass2={t_pass2:.2f}s)")
+
+	# STEP 4 — Cache save
+	cache_data = {
+		"resume_hash": resume_hash,
+		"already_exists": already_exists,
+		"parsed": parsed_dict,
+	}
+	step_start = time.time()
+	cache_utils.save_to_cache(resume_hash, cache_data)
+	t_cache = time.time() - step_start
+	print(f"[TIMING] Cache save: {t_cache:.2f} seconds")
+
+	total_elapsed = time.perf_counter() - overall_start
+	print("=" * 50)
+	print("[TIMING SUMMARY]")
+	print(f"  Text extraction : {t_extract:.2f}s")
+	print(f"  Hash check      : {t_hash:.2f}s")
+	print(f"  LLM Pass 1      : {t_pass1:.2f}s")
+	print(f"  LLM Pass 2      : {t_pass2:.2f}s")
+	print(f"  Cache save      : {t_cache:.2f}s")
+	print(f"  TOTAL           : {total_elapsed:.2f}s")
+	print("=" * 50)
+
+	logger.info("Preview pipeline complete")
+	return cache_data
 
 
-async def save_confirmed_resume(db: AsyncSession, resume_hash: str, parsed: ParsedResume) -> dict:
-    """
-    Saves a confirmed/edited ParsedResume to the database.
-    This is called after the user has reviewed and edited the parsed data.
-    
-    Runs Steps 4-15 of the full pipeline (skips extraction and parsing).
-    
-    Parameters:
-        db: Database session
-        resume_hash: SHA-256 hash of the original resume text
-        parsed: The confirmed ParsedResume object
-        
-    Returns:
-        dict with student_id, resume_hash, summary, and warnings
-        
-    Raises:
-        ValueError: If critical save steps fail
-    """
-    logger.info("=== STARTING SAVE CONFIRMED RESUME ===")
-    
-    warnings = []
-    summary = {
-        "schools_saved": 0,
-        "educations_saved": 0,
-        "workexps_saved": 0,
-        "projects_saved": 0,
-        "skills_saved": 0,
-        "languages_saved": 0,
-        "certifications_saved": 0,
-        "interests_saved": 0,
-        "addresses_saved": 0
-    }
-    
-    # Check if hash already exists (for already_existed flag)
-    logger.info("Pre-check: Checking if resume hash already exists")
-    try:
-        result = await db.execute(
-            text("SELECT student_id FROM tbl_cp_resume_hashes WHERE hash = :hash"),
-            {"hash": resume_hash}
-        )
-        existing = result.fetchone()
-        already_existed = existing is not None
-    except Exception as e:
-        logger.warning(f"Pre-check warning: {str(e)}")
-        already_existed = False
-    
-    # STEP 4 — Save student core record
-    logger.info("STEP 4 — Save student core record")
-    try:
-        student_request = SaveStudentRequest(
-            salutation=parsed.salutation,
-            first_name=parsed.first_name,
-            middle_name=parsed.middle_name,
-            last_name=parsed.last_name,
-            email=parsed.email,
-            alt_email=parsed.alt_email,
-            contact_number=parsed.contact_number,
-            alt_contact_number=parsed.alt_contact_number,
-            linkedin_url=parsed.linkedin_url,
-            github_url=parsed.github_url,
-            portfolio_url=parsed.portfolio_url,
-            date_of_birth=parsed.date_of_birth,
-            current_city=parsed.current_city,
-            gender=parsed.gender
-        )
-        student_id = await save_service.save_student(db, student_request)
-        logger.info(f"Step 4 complete: student_id={student_id}")
-    except Exception as e:
-        logger.error(f"Step 4 failed: {str(e)}")
-        raise ValueError(f"Failed to save student record: {str(e)}")
-    
-    # STEP 5 — Save school records
-    logger.info("STEP 5 — Save school records")
-    try:
-        for school_item in parsed.school:
-            if not school_item.standard:
-                continue
-            try:
-                await save_service.save_school(
-                    db,
-                    SaveSchoolRequest(
-                        student_id=student_id,
-                        standard=school_item.standard,
-                        board=school_item.board,
-                        school_name=school_item.school_name,
-                        percentage=school_item.percentage,
-                        passing_year=school_item.passing_year
-                    )
-                )
-                summary["schools_saved"] += 1
-            except Exception as e:
-                logger.warning(f"Failed to save school: {str(e)}")
-                warnings.append(f"School save failed: {str(e)}")
-        
-        logger.info(f"Step 5 complete: {summary['schools_saved']} school records saved")
-    except Exception as e:
-        logger.warning(f"Step 5 warning: {str(e)}")
-    
-    # STEP 6 — Save college education
-    logger.info("STEP 6 — Save college education")
-    try:
-        for edu_item in parsed.education:
-            if not edu_item.college_name or not edu_item.course_name:
-                continue
-            try:
-                college_result = await lookup_service.find_or_create_college(db, edu_item.college_name)
-                college_id = college_result.college_id
-                
-                course_result = await lookup_service.find_or_create_course(
-                    db,
-                    edu_item.course_name,
-                    edu_item.specialization_name or "General"
-                )
-                course_id = course_result.course_id
-                
-                await save_service.save_education(
-                    db,
-                    SaveEducationRequest(
-                        student_id=student_id,
-                        college_id=college_id,
-                        course_id=course_id,
-                        start_year=edu_item.start_year,
-                        end_year=edu_item.end_year,
-                        cgpa=edu_item.cgpa,
-                        percentage=edu_item.percentage
-                    )
-                )
-                summary["educations_saved"] += 1
-            except Exception as e:
-                logger.warning(f"Failed to save education: {str(e)}")
-                warnings.append(f"Education save failed: {str(e)}")
-        
-        logger.info(f"Step 6 complete: {summary['educations_saved']} education records saved")
-    except Exception as e:
-        logger.warning(f"Step 6 warning: {str(e)}")
-    
-    # STEP 7 — Save work experience
-    logger.info("STEP 7 — Save work experience")
-    workexp_map = {}
-    try:
-        for exp_item in parsed.workexp:
-            if not exp_item.company_name:
-                continue
-            try:
-                result = await save_service.save_workexp(
-                    db,
-                    SaveWorkExpRequest(
-                        student_id=student_id,
-                        company_name=exp_item.company_name,
-                        company_location=exp_item.company_location,
-                        designation=exp_item.designation,
-                        employment_type=exp_item.employment_type,
-                        start_date=exp_item.start_date,
-                        end_date=exp_item.end_date,
-                        is_current=exp_item.is_current
-                    )
-                )
-                workexp_map[exp_item.company_name] = result.workexp_id
-                summary["workexps_saved"] += 1
-            except Exception as e:
-                logger.warning(f"Failed to save workexp: {str(e)}")
-                warnings.append(f"Work experience save failed: {str(e)}")
-        
-        logger.info(f"Step 7 complete: {summary['workexps_saved']} workexp records saved")
-    except Exception as e:
-        logger.warning(f"Step 7 warning: {str(e)}")
-        workexp_map = {}
-    
-    # STEP 8 — Save projects + project skills
-    logger.info("STEP 8 — Save projects + project skills")
-    try:
-        for proj_item in parsed.projects:
-            if not proj_item.project_title:
-                continue
-            try:
-                # Resolve workexp_id
-                linked_workexp_id = None
-                if proj_item.workexp_company_name:
-                    linked_workexp_id = workexp_map.get(proj_item.workexp_company_name, None)
-                
-                proj_result = await save_service.save_project(
-                    db,
-                    SaveProjectRequest(
-                        student_id=student_id,
-                        workexp_id=linked_workexp_id,
-                        project_title=proj_item.project_title,
-                        project_description=proj_item.project_description,
-                        achievements=proj_item.achievements,
-                        project_start_date=proj_item.project_start_date,
-                        project_end_date=proj_item.project_end_date
-                    )
-                )
-                
-                # Link skills to project
-                for skill_name in proj_item.skills_used or []:
-                    if skill_name:
-                        skill_result = await lookup_service.find_or_create_skill(
-                            db, skill_name, "Intermediate"
-                        )
-                        await save_service.save_project_skill(db, proj_result.project_id, skill_result.skill_id)
-                
-                summary["projects_saved"] += 1
-            except Exception as e:
-                logger.warning(f"Failed to save project: {str(e)}")
-                warnings.append(f"Project save failed: {str(e)}")
-        
-        logger.info(f"Step 8 complete: {summary['projects_saved']} projects saved")
-    except Exception as e:
-        logger.warning(f"Step 8 warning: {str(e)}")
-    
-    # STEP 9 — Save student skills
-    logger.info("STEP 9 — Save student skills")
-    try:
-        for skill_item in parsed.skills:
-            if not skill_item.name:
-                continue
-            try:
-                skill_result = await lookup_service.find_or_create_skill(
-                    db, skill_item.name, skill_item.complexity or "Intermediate"
-                )
-                await save_service.save_student_skill(db, student_id, skill_result.skill_id)
-                summary["skills_saved"] += 1
-            except Exception as e:
-                logger.warning(f"Failed to save student skill: {str(e)}")
-                warnings.append(f"Student skill save failed: {str(e)}")
-        
-        logger.info(f"Step 9 complete: {summary['skills_saved']} skills linked to student")
-    except Exception as e:
-        logger.warning(f"Step 9 warning: {str(e)}")
-    
-    # STEP 10 — Save languages
-    logger.info("STEP 10 — Save languages")
-    try:
-        for lang_item in parsed.languages:
-            if not lang_item.language_name:
-                continue
-            try:
-                lang_result = await lookup_service.find_or_create_language(db, lang_item.language_name)
-                await save_service.save_student_language(db, student_id, lang_result.language_id)
-                summary["languages_saved"] += 1
-            except Exception as e:
-                logger.warning(f"Failed to save student language: {str(e)}")
-                warnings.append(f"Language save failed: {str(e)}")
-        
-        logger.info(f"Step 10 complete: {summary['languages_saved']} languages linked to student")
-    except Exception as e:
-        logger.warning(f"Step 10 warning: {str(e)}")
-    
-    # STEP 11 — Save certifications
-    logger.info("STEP 11 — Save certifications")
-    try:
-        for cert_item in parsed.certifications:
-            if not cert_item.certification_name or not cert_item.issuing_organization:
-                continue
-            try:
-                cert_result = await lookup_service.find_or_create_certification(
-                    db,
-                    cert_item.certification_name,
-                    cert_item.issuing_organization,
-                    cert_item.certification_type or "General",
-                    cert_item.is_lifetime
-                )
-                await save_service.save_student_certification(
-                    db,
-                    {
-                        "student_id": student_id,
-                        "certification_id": cert_result.certification_id,
-                        "issue_date": cert_item.issue_date,
-                        "expiry_date": cert_item.expiry_date,
-                        "certificate_url": cert_item.certificate_url,
-                        "credential_id": cert_item.credential_id
-                    }
-                )
-                summary["certifications_saved"] += 1
-            except Exception as e:
-                logger.warning(f"Failed to save certification: {str(e)}")
-                warnings.append(f"Certification save failed: {str(e)}")
-        logger.info(f"Step 11 complete: {summary['certifications_saved']} certifications saved")
-    except Exception as e:
-        logger.warning(f"Step 11 warning: {str(e)}")
-    
-    # STEP 12 — Save interests
-    logger.info("STEP 12 — Save interests")
-    try:
-        for interest_item in parsed.interests:
-            if not interest_item.name:
-                continue
-            try:
-                interest_result = await lookup_service.find_or_create_interest(db, interest_item.name)
-                await save_service.save_student_interest(db, student_id, interest_result.interest_id)
-                summary["interests_saved"] += 1
-            except Exception as e:
-                logger.warning(f"Failed to save student interest: {str(e)}")
-                warnings.append(f"Interest save failed: {str(e)}")
-        
-        logger.info(f"Step 12 complete: {summary['interests_saved']} interests linked")
-    except Exception as e:
-        logger.warning(f"Step 12 warning: {str(e)}")
-    
-    # STEP 13 — Save addresses
-    logger.info("STEP 13 — Save addresses")
-    try:
-        for addr_item in parsed.addresses:
-            if not addr_item.address_line_1 or not addr_item.pincode:
-                continue
-            try:
-                pincode_result = await lookup_service.find_pincode(db, addr_item.pincode)
-                if not pincode_result.found:
-                    logger.warning(f"Pincode {addr_item.pincode} not found in database")
-                    warnings.append(f"Pincode {addr_item.pincode} not found. Address skipped.")
-                    continue
-                
-                await save_service.save_address(
-                    db,
-                    SaveAddressRequest(
-                        student_id=student_id,
-                        address_line_1=addr_item.address_line_1,
-                        address_line_2=addr_item.address_line_2,
-                        landmark=addr_item.landmark,
-                        pincode_id=pincode_result.pincode_id,
-                        address_type=addr_item.address_type or "current"
-                    )
-                )
-                summary["addresses_saved"] += 1
-            except Exception as e:
-                logger.warning(f"Failed to save address: {str(e)}")
-                warnings.append(f"Address save failed: {str(e)}")
-        
-        logger.info(f"Step 13 complete: {summary['addresses_saved']} addresses saved")
-    except Exception as e:
-        logger.warning(f"Step 13 warning: {str(e)}")
-    
-    # STEP 14 — Store resume hash
-    logger.info("STEP 14 — Store resume hash")
-    try:
-        await db.execute(
-            text("INSERT INTO tbl_cp_resume_hashes (hash, student_id) VALUES (:hash, :student_id)"),
-            {"hash": resume_hash, "student_id": student_id}
-        )
-        await db.commit()
-        logger.info("Step 14 complete: resume hash stored")
-    except Exception as e:
-        logger.warning(f"Step 14 warning: {str(e)}")
-        warnings.append(f"Resume hash storage failed: {str(e)}")
-    
-    # STEP 15 — Return final summary
-    logger.info("STEP 15 — Return final summary")
-    logger.info("=== SAVE CONFIRMED COMPLETE ===")
+# ---------------------------------------------------------------------------
+# Save confirmed (no extraction/LLM, steps 4-15)
+# ---------------------------------------------------------------------------
+async def save_confirmed_resume(db: AsyncSession, resume_hash: str, parsed: ParsedResume) -> Dict[str, Any]:
+	"""Save a confirmed ParsedResume to the database (steps 4-15)."""
 
-    cache_utils.delete_from_cache(resume_hash)
-    logger.info(f"[SAVE-CONFIRMED] All data saved to DB successfully")
-    logger.info(f"[SAVE-CONFIRMED] Cache cleaned up for hash: {resume_hash}")
-    
-    return {
-        "student_id": student_id,
-        "resume_hash": resume_hash,
-        "already_existed": already_existed,
-        "summary": summary,
-        "warnings": warnings
-    }
+	warnings = []
+	summary = {
+		"schools_saved": 0,
+		"educations_saved": 0,
+		"workexps_saved": 0,
+		"projects_saved": 0,
+		"skills_saved": 0,
+		"languages_saved": 0,
+		"certifications_saved": 0,
+		"interests_saved": 0,
+		"addresses_saved": 0,
+	}
+
+	# If parsed comes as dict, coerce to ParsedResume for attribute access
+	if isinstance(parsed, dict):
+		parsed = ParsedResume(**parsed)
+
+	try:
+		result = await db.execute(
+			text("SELECT student_id FROM tbl_cp_resume_hashes WHERE hash = :hash"),
+			{"hash": resume_hash},
+		)
+		existing = result.fetchone()
+		already_existed = existing is not None
+	except Exception as e:
+		logger.warning(f"Hash pre-check failed: {e}")
+		already_existed = False
+
+	# STEP 4 — Save student core record
+	try:
+		salutation_id = None
+		if parsed.salutation:
+			sal_result = await lookup_service.find_salutation(db, parsed.salutation)
+			if getattr(sal_result, "found", False):
+				salutation_id = sal_result.salutation_id
+
+		student_request = SaveStudentRequest(
+			salutation_id=salutation_id,
+			first_name=parsed.first_name,
+			middle_name=parsed.middle_name,
+			last_name=parsed.last_name,
+			email=parsed.email,
+			alt_email=parsed.alt_email,
+			contact_number=parsed.contact_number,
+			alt_contact_number=parsed.alt_contact_number,
+			linkedin_url=parsed.linkedin_url,
+			github_url=parsed.github_url,
+			portfolio_url=parsed.portfolio_url,
+			date_of_birth=parsed.date_of_birth,
+			current_city=parsed.current_city,
+			gender=parsed.gender,
+		)
+		student_result = await save_service.save_student(db, student_request)
+		student_id = student_result.student_id
+	except Exception as e:
+		logger.error(f"Save-confirmed student save failed: {e}")
+		raise ValueError(f"Failed to save student record: {e}")
+
+	# STEP 5 — Save school records
+	try:
+		for school_item in parsed.school:
+			if not school_item.standard:
+				continue
+			try:
+				await save_service.save_school(
+					db,
+					SaveSchoolRequest(
+						student_id=student_id,
+						standard=school_item.standard,
+						board=school_item.board,
+						school_name=school_item.school_name,
+						percentage=school_item.percentage,
+						passing_year=school_item.passing_year,
+					),
+				)
+				summary["schools_saved"] += 1
+			except Exception as e:
+				logger.warning(f"Failed to save school: {e}")
+				warnings.append(f"School save failed: {e}")
+	except Exception as e:
+		logger.warning(f"Save-confirmed step 5 warning: {e}")
+
+	# STEP 6 — Save college education
+	try:
+		for edu_item in parsed.education:
+			if not edu_item.college_name or not edu_item.course_name:
+				continue
+			try:
+				college_result = await lookup_service.find_or_create_college(db, edu_item.college_name)
+				course_result = await lookup_service.find_or_create_course(
+					db,
+					edu_item.course_name,
+					edu_item.specialization_name or "General",
+				)
+				await save_service.save_education(
+					db,
+					SaveEducationRequest(
+						student_id=student_id,
+						college_id=college_result.college_id,
+						course_id=course_result.course_id,
+						start_year=edu_item.start_year,
+						end_year=edu_item.end_year,
+						cgpa=edu_item.cgpa,
+						percentage=edu_item.percentage,
+					),
+				)
+				summary["educations_saved"] += 1
+			except Exception as e:
+				logger.warning(f"Failed to save education: {e}")
+				warnings.append(f"Education save failed: {e}")
+	except Exception as e:
+		logger.warning(f"Save-confirmed step 6 warning: {e}")
+
+	# STEP 7 — Save work experience
+	workexp_map = {}
+	try:
+		for exp_item in parsed.workexp:
+			if not exp_item.company_name:
+				continue
+			try:
+				result = await save_service.save_workexp(
+					db,
+					SaveWorkExpRequest(
+						student_id=student_id,
+						company_name=exp_item.company_name,
+						company_location=exp_item.company_location,
+						designation=exp_item.designation,
+						employment_type=exp_item.employment_type,
+						start_date=exp_item.start_date,
+						end_date=exp_item.end_date,
+						is_current=exp_item.is_current,
+					),
+				)
+				workexp_map[exp_item.company_name] = result.workexp_id
+				summary["workexps_saved"] += 1
+			except Exception as e:
+				logger.warning(f"Failed to save workexp: {e}")
+				warnings.append(f"Work experience save failed: {e}")
+	except Exception as e:
+		logger.warning(f"Save-confirmed step 7 warning: {e}")
+
+	# STEP 8 — Save projects + skills
+	try:
+		for proj_item in parsed.projects:
+			if not proj_item.project_title:
+				continue
+			try:
+				linked_workexp_id = None
+				if proj_item.workexp_company_name:
+					linked_workexp_id = workexp_map.get(proj_item.workexp_company_name)
+
+				proj_result = await save_service.save_project(
+					db,
+					SaveProjectRequest(
+						student_id=student_id,
+						workexp_id=linked_workexp_id,
+						project_title=proj_item.project_title,
+						project_description=proj_item.project_description,
+						achievements=proj_item.achievements,
+						project_start_date=proj_item.project_start_date,
+						project_end_date=proj_item.project_end_date,
+					),
+				)
+				summary["projects_saved"] += 1
+
+				for skill_name in proj_item.skills_used:
+					if not skill_name:
+						continue
+					try:
+						skill_result = await lookup_service.find_or_create_skill(db, skill_name, "Intermediate")
+						await save_service.save_project_skill(db, proj_result.project_id, skill_result.skill_id)
+					except Exception as e:
+						logger.warning(f"Failed to save project skill: {e}")
+						warnings.append(f"Project skill save failed: {e}")
+			except Exception as e:
+				logger.warning(f"Failed to save project: {e}")
+				warnings.append(f"Project save failed: {e}")
+	except Exception as e:
+		logger.warning(f"Save-confirmed step 8 warning: {e}")
+
+	# STEP 9 — Save student skills
+	try:
+		for skill_item in parsed.skills:
+			if not skill_item.name:
+				continue
+			try:
+				skill_result = await lookup_service.find_or_create_skill(
+					db, skill_item.name, skill_item.complexity or "Intermediate"
+				)
+				await save_service.save_student_skill(db, student_id, skill_result.skill_id)
+				summary["skills_saved"] += 1
+			except Exception as e:
+				logger.warning(f"Failed to save student skill: {e}")
+				warnings.append(f"Student skill save failed: {e}")
+	except Exception as e:
+		logger.warning(f"Save-confirmed step 9 warning: {e}")
+
+	# STEP 10 — Save languages
+	try:
+		for lang_item in parsed.languages:
+			if not lang_item.language_name:
+				continue
+			try:
+				lang_result = await lookup_service.find_or_create_language(db, lang_item.language_name)
+				await save_service.save_student_language(db, student_id, lang_result.language_id)
+				summary["languages_saved"] += 1
+			except Exception as e:
+				logger.warning(f"Failed to save language: {e}")
+				warnings.append(f"Language save failed: {e}")
+	except Exception as e:
+		logger.warning(f"Save-confirmed step 10 warning: {e}")
+
+	# STEP 11 — Save certifications
+	try:
+		for cert_item in parsed.certifications:
+			if not cert_item.certification_name or not cert_item.issuing_organization:
+				continue
+			try:
+				cert_result = await lookup_service.find_or_create_certification(
+					db,
+					cert_item.certification_name,
+					cert_item.issuing_organization,
+					cert_item.certification_type or "General",
+					cert_item.is_lifetime,
+				)
+				await save_service.save_student_certification(
+					db,
+					{
+						"student_id": student_id,
+						"certification_id": cert_result.certification_id,
+						"issue_date": cert_item.issue_date,
+						"expiry_date": cert_item.expiry_date,
+						"certificate_url": cert_item.certificate_url,
+						"credential_id": cert_item.credential_id,
+					},
+				)
+				summary["certifications_saved"] += 1
+			except Exception as e:
+				logger.warning(f"Failed to save certification: {e}")
+				warnings.append(f"Certification save failed: {e}")
+	except Exception as e:
+		logger.warning(f"Save-confirmed step 11 warning: {e}")
+
+	# STEP 12 — Save interests
+	try:
+		for interest_item in parsed.interests:
+			if not interest_item.name:
+				continue
+			try:
+				interest_result = await lookup_service.find_or_create_interest(db, interest_item.name)
+				await save_service.save_student_interest(db, student_id, interest_result.interest_id)
+				summary["interests_saved"] += 1
+			except Exception as e:
+				logger.warning(f"Failed to save interest: {e}")
+				warnings.append(f"Interest save failed: {e}")
+	except Exception as e:
+		logger.warning(f"Save-confirmed step 12 warning: {e}")
+
+	# STEP 13 — Save addresses
+	try:
+		for addr_item in parsed.addresses:
+			if not addr_item.address_line_1 or not addr_item.pincode:
+				continue
+			try:
+				pincode_result = await lookup_service.find_pincode(db, addr_item.pincode)
+				if not getattr(pincode_result, "found", False):
+					warnings.append(f"Pincode {addr_item.pincode} not found. Address skipped.")
+					continue
+
+				await save_service.save_address(
+					db,
+					SaveAddressRequest(
+						student_id=student_id,
+						address_line_1=addr_item.address_line_1,
+						address_line_2=addr_item.address_line_2,
+						landmark=addr_item.landmark,
+						pincode_id=pincode_result.pincode_id,
+						address_type=addr_item.address_type or "current",
+					),
+				)
+				summary["addresses_saved"] += 1
+			except Exception as e:
+				logger.warning(f"Failed to save address: {e}")
+				warnings.append(f"Address save failed: {e}")
+	except Exception as e:
+		logger.warning(f"Save-confirmed step 13 warning: {e}")
+
+	# STEP 14 — Store resume hash
+	try:
+		await db.execute(
+			text("INSERT INTO tbl_cp_resume_hashes (hash, student_id) VALUES (:hash, :student_id)"),
+			{"hash": resume_hash, "student_id": student_id},
+		)
+		await db.commit()
+	except Exception as e:
+		logger.warning(f"Resume hash storage failed: {e}")
+		warnings.append(f"Resume hash storage failed: {e}")
+
+	return {
+		"student_id": student_id,
+		"resume_hash": resume_hash,
+		"already_existed": already_existed,
+		"summary": summary,
+		"warnings": warnings,
+	}
+
