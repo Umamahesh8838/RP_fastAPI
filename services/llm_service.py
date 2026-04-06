@@ -1,15 +1,20 @@
-import ollama
 import json
 import re
 import logging
+import time
+import asyncio
+import httpx
 from config import get_settings
 from schemas.parse_schema import ParsedResume
-from utils.hash_utils import compute_resume_hash
 
+# Setup OpenRouter client at module level
+settings = get_settings()
 logger = logging.getLogger(__name__)
 
-settings = get_settings()
-client = ollama.Client(host=settings.ollama_base_url)
+# OpenRouter API configuration
+OPENROUTER_API_KEY = settings.openrouter_api_key
+OPENROUTER_MODEL = settings.openrouter_model
+OPENROUTER_API_BASE = "https://openrouter.ai/api/v1"
 
 SYSTEM_PROMPT_PASS1 = """
 You are a precise resume data extraction engine.
@@ -204,106 +209,166 @@ JSON_SCHEMA_TEMPLATE = """{
 
 def clean_and_parse_json(raw_text: str) -> dict:
     """
-    Cleans JSON response by removing markdown code fences and parses it.
-    Handles cases where Ollama returns broken or partial JSON.
-    
-    Parameters:
-        raw_text (str): Raw LLM response text
-        
-    Returns:
-        dict: Parsed JSON object
-        
-    Raises:
-        ValueError: If JSON parsing fails after all attempts
+    Strips markdown fences and parses JSON from LLM response.
+    OpenRouter sometimes adds ```json blocks even with JSON content-type.
     """
     clean = raw_text.strip()
     clean = re.sub(r'^```json\s*', '', clean, flags=re.IGNORECASE)
     clean = re.sub(r'^```\s*', '', clean)
     clean = re.sub(r'\s*```$', '', clean)
-    clean = clean.strip()
-    
-    # Attempt 1: Try normal json.loads() first
     try:
-        return json.loads(clean)
-    except json.JSONDecodeError:
-        pass
+        return json.loads(clean.strip())
+    except json.JSONDecodeError as e:
+        # Try to find JSON object in the text
+        start = clean.find('{')
+        end = clean.rfind('}')
+        if start != -1 and end != -1:
+            try:
+                return json.loads(clean[start:end+1])
+            except:
+                pass
+        raise ValueError(
+            f"OpenRouter response is not valid JSON: {e}. "
+            f"Raw text preview: {raw_text[:300]}"
+        )
+
+
+async def _call_openrouter_api(full_prompt: str) -> str:
+    """
+    Async call to OpenRouter API.
+    Uses httpx.AsyncClient for non-blocking HTTP requests.
+    Returns raw text response from the LLM.
+    """
+    print(f"[OPENROUTER] Starting API call...")
+    print(f"[OPENROUTER] Prompt length: {len(full_prompt)} chars")
     
-    # Attempt 2: If that fails, try to extract JSON from text
-    # Find first { and last } to handle cases where Ollama adds text before/after JSON
-    first_brace = clean.find('{')
-    last_brace = clean.rfind('}')
+    start = time.time()
     
-    if first_brace != -1 and last_brace != -1 and first_brace < last_brace:
-        json_substring = clean[first_brace:last_brace + 1]
-        try:
-            return json.loads(json_substring)
-        except json.JSONDecodeError:
-            pass
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "http://localhost:8000",
+        "X-Title": "Resume Parser"
+    }
     
-    # Attempt 3: If all else fails, log and raise
-    logger.debug(f"LLM returned invalid JSON. Raw response:\n{raw_text}")
-    raise ValueError(
-        "LLM returned invalid JSON. Try a different model or check Ollama."
-    )
+    payload = {
+        "model": OPENROUTER_MODEL,
+        "messages": [
+            {"role": "user", "content": full_prompt}
+        ],
+        "temperature": 0.0,
+        "max_tokens": 4096
+    }
+    
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.post(
+                f"{OPENROUTER_API_BASE}/chat/completions",
+                headers=headers,
+                json=payload
+            )
+            
+            elapsed = time.time() - start
+            
+            if response.status_code != 200:
+                error_text = response.text
+                print(f"[OPENROUTER] ERROR after {elapsed:.2f}s: Status {response.status_code}")
+                print(f"[OPENROUTER] Response: {error_text}")
+                logger.error(f"[OPENROUTER] API Error {response.status_code}: {error_text}")
+                raise ValueError(f"OpenRouter API error: {response.status_code} - {error_text}")
+            
+            result = response.json()
+            message_content = result["choices"][0]["message"]["content"]
+            
+            print(f"[OPENROUTER] Got response in {elapsed:.2f}s")
+            print(f"[OPENROUTER] Response length: {len(message_content)} chars")
+            
+            return message_content
+        
+    except asyncio.TimeoutError:
+        elapsed = time.time() - start
+        print(f"[OPENROUTER] TIMEOUT after {elapsed:.2f}s")
+        logger.error(f"[OPENROUTER] Timeout after {elapsed:.2f}s")
+        raise
+    except Exception as e:
+        elapsed = time.time() - start
+        print(f"[OPENROUTER] ERROR after {elapsed:.2f}s: {str(e)}")
+        logger.error(f"[OPENROUTER] API error: {e}")
+        raise
+
+
+async def _call_gemini_api(full_prompt: str) -> str:
+    """
+    DEPRECATED - Use _call_openrouter_api instead.
+    This function is kept for backward compatibility but redirects to OpenRouter.
+    """
+    return await _call_openrouter_api(full_prompt)
 
 
 async def call_llm(system_prompt: str, user_message: str) -> dict:
     """
-    Makes one call to the Anthropic Claude API.
-    
-    Parameters:
-        system_prompt (str): System prompt to guide the LLM
-        user_message (str): User message/resume text
-        
-    Returns:
-        dict: Parsed JSON response from LLM
-        
-    Raises:
-        ValueError: If API call fails or response is not valid JSON
+    Calls OpenRouter API asynchronously.
+    No blocking calls - fully async/await compatible with FastAPI.
+    Includes 120-second timeout protection.
     """
-    logger.debug(f"Calling Ollama LLM (model={settings.ollama_model})")
+    
+    full_prompt = f"""{system_prompt}
 
+=== YOUR TASK ===
+{user_message}
+
+REMINDER: Return ONLY valid JSON. No explanation. 
+No markdown. No extra text. Pure JSON only."""
+
+    print(f"[OPENROUTER] Calling OpenRouter API (async)...")
+    start_time = time.time()
+    
     try:
-        # Combine system and user messages for Ollama
-        full_message = f"{system_prompt}\n\n{user_message}"
-        
-        response = client.generate(
-            model=settings.ollama_model,
-            prompt=full_message,
-            stream=False,
-            options={
-                "temperature": settings.claude_temperature,
-                "top_p": 0.9,
-            }
+        # True async call - no blocking
+        raw_text = await asyncio.wait_for(
+            _call_openrouter_api(full_prompt),
+            timeout=120.0  # 2 minute timeout
         )
         
-        raw_text = response["response"]
-        logger.debug("Received Ollama response, parsing JSON")
+        elapsed = time.time() - start_time
+        print(f"[OPENROUTER] Response received in {elapsed:.2f}s")
         
-        return clean_and_parse_json(raw_text)
+        result = clean_and_parse_json(raw_text)
+        print(f"[OPENROUTER] JSON parsed successfully")
+        return result
+        
+    except asyncio.TimeoutError:
+        elapsed = time.time() - start_time
+        print(f"[OPENROUTER] TIMEOUT after {elapsed:.2f}s")
+        logger.error(f"[OPENROUTER] Timeout after {elapsed:.2f}s")
+        raise ValueError(
+            "OpenRouter API timed out after 2 minutes. "
+            "Check your API key and internet connection."
+        )
         
     except Exception as e:
-        logger.error(f"Ollama API error: {str(e)}")
-        raise ValueError(f"LLM API error: {str(e)}")
-
-
-async def merge_pass1_and_pass2(pass1: dict, pass2: dict) -> dict:
-    """
-    Merges two LLM extraction passes.
-    Pass 2 is treated as more authoritative (gap checking and corrections).
-    
-    Parameters:
-        pass1 (dict): First pass extraction
-        pass2 (dict): Second pass extraction (gap checking)
+        elapsed = time.time() - start_time
+        error_str = str(e)
         
-    Returns:
-        dict: Merged result
+        print(f"[OPENROUTER] ERROR after {elapsed:.2f}s: {error_str}")
+        logger.error(f"[OPENROUTER] API error: {e}")
+        raise
+
+
+def merge_pass1_and_pass2(pass1: dict, pass2: dict) -> dict:
     """
-    logger.debug("Merging pass1 and pass2 results")
-    
-    # For most fields, prefer pass2 if not null
-    merged = pass2.copy()
-    
+    Merges two LLM pass results.
+    For scalars: use pass2 if not None, else pass1.
+    For arrays: use whichever is longer.
+    """
+    merged = dict(pass1)
+    for key in pass2:
+        if isinstance(pass2[key], list):
+            p1_arr = pass1.get(key) or []
+            p2_arr = pass2.get(key) or []
+            merged[key] = p2_arr if len(p2_arr) >= len(p1_arr) else p1_arr
+        else:
+            merged[key] = pass2[key] if pass2[key] is not None else pass1.get(key)
     return merged
 
 
@@ -312,6 +377,7 @@ def normalize_merged(merged: dict) -> dict:
   Normalizes certain LLM output fields to match Pydantic schema types.
 
   - Convert education[].cgpa from strings like '3.8/4.0' or '3.8' to float 3.8
+  - Convert education[].start_year and end_year from date strings to int (extract year)
   - Convert projects[].skills_used entries that are objects to simple strings (skill names)
   - Convert school[].passing_year to int if provided as string/date
   """
@@ -328,8 +394,51 @@ def normalize_merged(merged: dict) -> dict:
       else:
         sch["passing_year"] = None
 
-  # Normalize CGPA in education entries
+  # Normalize start_year and end_year in education entries (extract 4-digit year from dates)
   for edu in merged.get("education", []):
+    if not isinstance(edu, dict):
+      continue
+    for year_field in ["start_year", "end_year"]:
+      year_val = edu.get(year_field)
+      if year_val is None:
+        continue
+      if isinstance(year_val, int):
+        # Already an integer, leave it
+        continue
+      if isinstance(year_val, str):
+        year_val = year_val.strip()
+        if not year_val:
+          edu[year_field] = None
+          continue
+        # Try to extract 4-digit year from date strings like "2026-01-01"
+        m = re.search(r"(\d{4})", year_val)
+        if m:
+          try:
+            edu[year_field] = int(m.group(1))
+          except Exception as e:
+            print(f"[WARNING] Failed to convert {year_field}={year_val}: {e}")
+            edu[year_field] = None
+        else:
+          # Try direct int conversion
+          try:
+            edu[year_field] = int(year_val)
+          except Exception:
+            print(f"[WARNING] Could not extract year from {year_field}={year_val}")
+            edu[year_field] = None
+      else:
+        # For any other type, try converting to string first then extracting year
+        try:
+          str_val = str(year_val).strip()
+          m = re.search(r"(\d{4})", str_val)
+          if m:
+            edu[year_field] = int(m.group(1))
+          else:
+            edu[year_field] = None
+        except Exception as e:
+          print(f"[WARNING] Failed to process {year_field}={year_val} (type={type(year_val)}): {e}")
+          edu[year_field] = None
+    
+    # Normalize CGPA
     cgpa = edu.get("cgpa")
     if isinstance(cgpa, str):
       # Try to extract the first float (handles '3.8/4.0', '3.8', '3.8 out of 4')
@@ -373,51 +482,159 @@ def normalize_merged(merged: dict) -> dict:
 
 async def parse_resume_text(resume_text: str) -> ParsedResume:
     """
-    Full two-pass LLM extraction pipeline.
-    Pass 1: extract everything.
-    Pass 2: find missed data and fix errors.
-    Validates required fields after merge.
+    Full two-pass OpenRouter extraction pipeline.
+    
+    Pass 1: Full extraction of all resume fields.
+    Pass 2: Gap check to find missed data and fix errors.
+    Merge: Combine both passes taking best value per field.
+    Validate: Ensure first_name and email are present.
     
     Parameters:
-        resume_text (str): Raw resume text
+        resume_text: raw text extracted from resume file
         
     Returns:
-        ParsedResume: Validated Pydantic model
+        ParsedResume Pydantic model
         
     Raises:
-        ValueError: If required fields missing or parsing fails
+        ValueError: if resume too short or critical fields missing
+        Exception: if OpenRouter API calls fail
     """
-    logger.info("Starting two-pass LLM parsing")
     
     if len(resume_text.strip()) < 100:
-        raise ValueError("Resume text must be at least 100 characters")
+        raise ValueError(
+            "Resume text too short (min 100 characters). "
+            "File may be empty or unreadable."
+        )
     
-    # PASS 1: Initial extraction
-    logger.info("Pass 1: Initial extraction")
-    pass1_user_msg = f"Extract all data from this resume and return as JSON matching the schema:\n\n{JSON_SCHEMA_TEMPLATE}\n\nResume text:\n\n{resume_text}"
+    total_start = time.time()
     
-    pass1_result = await call_llm(SYSTEM_PROMPT_PASS1, pass1_user_msg)
-    logger.debug(f"Pass 1 result: first_name={pass1_result.get('first_name')}, email={pass1_result.get('email')}")
+    # ── PASS 1 ──────────────────────────────────────
+    print("=" * 55)
+    print("[OPENROUTER PASS 1] Starting full extraction...")
+    print(f"[OPENROUTER PASS 1] Resume length: {len(resume_text)} chars")
+    pass1_start = time.time()
     
-    # PASS 2: Gap checking and corrections
-    logger.info("Pass 2: Gap checking and corrections")
-    pass2_user_msg = f"Original resume:\n\n{resume_text}\n\nAlready extracted JSON:\n\n{json.dumps(pass1_result, indent=2)}\n\nFix any gaps and errors in the JSON, return complete corrected JSON."
+    user_message_pass1 = f"""Extract all data from the resume below.
+Return ONLY a JSON object that exactly matches this schema.
+Every field must be present. Missing values must be null.
+
+===== RESUME TEXT START =====
+{resume_text}
+===== RESUME TEXT END =====
+
+===== REQUIRED JSON SCHEMA =====
+{JSON_SCHEMA_TEMPLATE}"""
+
+    pass1_result = await call_llm(SYSTEM_PROMPT_PASS1, user_message_pass1)
+    pass1_elapsed = time.time() - pass1_start
     
-    pass2_result = await call_llm(SYSTEM_PROMPT_PASS2, pass2_user_msg)
-    logger.debug(f"Pass 2 result: first_name={pass2_result.get('first_name')}, email={pass2_result.get('email')}")
+    print(f"[OPENROUTER PASS 1] ✓ Complete in {pass1_elapsed:.2f}s")
+    print(f"[OPENROUTER PASS 1] Name: {pass1_result.get('first_name')} {pass1_result.get('last_name')}")
+    print(f"[OPENROUTER PASS 1] Email: {pass1_result.get('email')}")
+    print(f"[OPENROUTER PASS 1] Skills: {len(pass1_result.get('skills') or [])}")
+    print(f"[OPENROUTER PASS 1] Projects: {len(pass1_result.get('projects') or [])}")
     
-    # Merge results (pass2 is more authoritative)
-    merged = await merge_pass1_and_pass2(pass1_result, pass2_result)
+    # ── PASS 2 ──────────────────────────────────────
+    print(f"[OPENROUTER PASS 2] Starting gap check...")
+    pass2_start = time.time()
+    
+    user_message_pass2 = f"""Here is the original resume text:
+===== RESUME TEXT START =====
+{resume_text}
+===== RESUME TEXT END =====
+
+Here is the JSON extracted in the first pass:
+===== EXTRACTED JSON START =====
+{json.dumps(pass1_result, indent=2)}
+===== EXTRACTED JSON END =====
+
+Re-read the resume carefully line by line.
+Find anything that was missed or incorrect.
+Return the corrected complete JSON."""
+
+    try:
+        pass2_result = await call_llm(SYSTEM_PROMPT_PASS2, user_message_pass2)
+        pass2_elapsed = time.time() - pass2_start
+        print(f"[OPENROUTER PASS 2] ✓ Complete in {pass2_elapsed:.2f}s")
+    except Exception as e:
+        pass2_elapsed = time.time() - pass2_start
+        print(f"[OPENROUTER PASS 2] ⚠ Failed ({pass2_elapsed:.2f}s): {e}")
+        print(f"[OPENROUTER PASS 2] Using Pass 1 result only")
+        logger.warning(f"Pass 2 failed, using Pass 1: {e}")
+        pass2_result = pass1_result
+    
+    # ── MERGE ───────────────────────────────────────
+    print(f"[OPENROUTER MERGE] Merging pass results...")
+    merged = merge_pass1_and_pass2(pass1_result, pass2_result)
+    
     # Normalize fields that may come in wrong types from LLM
+    print(f"[OPENROUTER] Before normalize - education items: {len(merged.get('education', []))}")
+    if merged.get('education') and len(merged['education']) > 0:
+        print(f"[OPENROUTER] First education start_year type: {type(merged['education'][0].get('start_year'))}, value: {merged['education'][0].get('start_year')}")
+    
     merged = normalize_merged(merged)
     
-    # Validate required fields
-    if not merged.get('first_name'):
-        raise ValueError("first_name is required but not found in resume")
-    if not merged.get('email'):
-        raise ValueError("email is required but not found in resume")
+    print(f"[OPENROUTER] After normalize - education items: {len(merged.get('education', []))}")
+    if merged.get('education') and len(merged['education']) > 0:
+        print(f"[OPENROUTER] First education start_year type: {type(merged['education'][0].get('start_year'))}, value: {merged['education'][0].get('start_year')}")
+        print(f"[OPENROUTER] First education end_year type: {type(merged['education'][0].get('end_year'))}, value: {merged['education'][0].get('end_year')}")
     
-    logger.info("LLM parsing complete and validated")
+    # ── VALIDATE ────────────────────────────────────
+    if not merged.get("first_name") and not merged.get("email"):
+        raise ValueError(
+            "OpenRouter failed to extract first_name or email. "
+            "Resume may be unreadable or in unsupported format."
+        )
     
-    # Return as Pydantic model
-    return ParsedResume(**merged)
+    total_elapsed = time.time() - total_start
+    
+    print("=" * 55)
+    print(f"[OPENROUTER TIMING SUMMARY]")
+    print(f"  Pass 1 (extraction) : {pass1_elapsed:.2f}s")
+    print(f"  Pass 2 (gap check)  : {pass2_elapsed:.2f}s")
+    print(f"  TOTAL               : {total_elapsed:.2f}s")
+    print(f"[OPENROUTER] Student: {merged.get('first_name')} {merged.get('last_name')}")
+    print(f"[OPENROUTER] Email  : {merged.get('email')}")
+    print("=" * 55)
+    
+    logger.info(f"[OPENROUTER] Complete in {total_elapsed:.2f}s")
+    
+    # Final safety check: manually ensure education years are integers
+    if merged.get('education'):
+        for i, edu in enumerate(merged['education']):
+            for year_field in ['start_year', 'end_year']:
+                val = edu.get(year_field)
+                if val is not None and not isinstance(val, int):
+                    print(f"[CRITICAL] Education[{i}].{year_field} is still {type(val)}: {val}")
+                    import re
+                    if isinstance(val, str):
+                        m = re.search(r'(\d{4})', val)
+                        if m:
+                            edu[year_field] = int(m.group(1))
+                            print(f"[FIXED] Converted to {edu[year_field]}")
+    
+    try:
+        return ParsedResume(**merged)
+    except Exception as e:
+        logger.error(f"Failed to create ParsedResume: {e}")
+        logger.error(f"Education data: {merged.get('education', [])[:1]}")  # Log first education item for debugging
+        raise
+
+
+async def test_openrouter_connection() -> bool:
+    """
+    Quick test to verify OpenRouter API key and connection work.
+    Call this from /health endpoint to verify setup.
+    Returns True if working, False if not.
+    """
+    try:
+        print("[OPENROUTER TEST] Testing connection...")
+        result = await asyncio.wait_for(
+            _call_openrouter_api("Reply with: ok"),
+            timeout=30.0
+        )
+        print(f"[OPENROUTER TEST] ✓ Connection works: {result[:50]}")
+        return True
+    except Exception as e:
+        print(f"[OPENROUTER TEST] ✗ Connection failed: {e}")
+        return False

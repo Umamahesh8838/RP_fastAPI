@@ -1,4 +1,4 @@
-from fastapi import APIRouter, UploadFile, File, Depends, Request
+from fastapi import APIRouter, UploadFile, File, Depends, Request, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
@@ -13,6 +13,8 @@ from config import get_settings
 import asyncio
 import json
 import logging
+import os
+import uuid
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -158,6 +160,21 @@ async def parse_with_progress(request: Request, file: UploadFile = File(...), db
             status_code=400
         )
 
+    # READ FILE IMMEDIATELY before streaming (critical!)
+    try:
+        file_bytes = await file.read()
+    except Exception as e:
+        logger.error(f"Error reading file: {e}")
+        return error_response("Failed to read file", detail=str(e), status_code=400)
+    
+    file_size_mb = len(file_bytes) / (1024 * 1024)
+    if file_size_mb > settings.max_file_size_mb:
+        return error_response(
+            "File too large",
+            detail=f"Max size is {settings.max_file_size_mb}MB",
+            status_code=413
+        )
+
     headers = {
         "Cache-Control": "no-cache",
         "Connection": "keep-alive",
@@ -175,10 +192,9 @@ async def parse_with_progress(request: Request, file: UploadFile = File(...), db
         async def producer():
             try:
                 await emit("progress", {"step": 1, "message": "Reading resume file...", "percent": 5})
-                file_bytes = await file.read()
 
-                file_size_mb = len(file_bytes) / (1024 * 1024)
-                if file_size_mb > settings.max_file_size_mb:
+                file_size_mb_check = len(file_bytes) / (1024 * 1024)
+                if file_size_mb_check > settings.max_file_size_mb:
                     await emit("error", {"message": f"File too large. Max size is {settings.max_file_size_mb}MB"})
                     return
 
@@ -342,3 +358,206 @@ async def cache_status():
         "cached_count": len(hashes),
         "cached_hashes": hashes
     })
+
+
+@router.get(
+    "/quality-score/{resume_hash}",
+    response_model=SuccessResponse,
+    responses={404: {"model": ErrorResponse}}
+)
+async def get_quality_score(resume_hash: str):
+    """
+    Get the quality score for an already-parsed resume using its hash.
+    Loads from cache so no LLM call needed.
+    
+    Parameters:
+        resume_hash: The hash of the resume to get quality score for
+        
+    Returns:
+        Success response with quality score breakdown, grade, and suggestions
+    """
+    try:
+        from utils.quality_score import calculate_resume_quality
+        
+        # Load cached data
+        cached = cache_utils.load_from_cache(resume_hash)
+        if not cached:
+            return error_response(
+                "No cached data found for this resume hash",
+                detail="Upload the resume first using /resume/parse-preview",
+                status_code=404
+            )
+        
+        # Check if quality already in cached data
+        if "quality" in cached:
+            return success_response(cached["quality"])
+        
+        # If quality not in cached data (older cache), recalculate it
+        if "parsed" in cached:
+            quality = calculate_resume_quality(cached["parsed"])
+            return success_response(quality)
+        
+        # If no parsed data either, this cache is incomplete
+        return error_response(
+            "Cached data is incomplete",
+            detail="Please re-upload the resume",
+            status_code=400
+        )
+        
+    except Exception as e:
+        logger.error(f"Error getting quality score: {e}")
+        return error_response("Internal server error", detail=str(e), status_code=500)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# BULK UPLOAD ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.post(
+    "/bulk-upload",
+    response_model=SuccessResponse,
+    responses={400: {"model": ErrorResponse}, 413: {"model": ErrorResponse}}
+)
+async def bulk_upload_resumes(
+    background_tasks: BackgroundTasks,
+    files: list[UploadFile] = File(...),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Upload multiple resumes (max 10) for batch processing.
+    Returns batch_id immediately. Processing happens in background.
+    Check /resume/bulk-status/{batch_id} for progress.
+    """
+    from utils.bulk_tracker import create_batch
+    
+    try:
+        # Validate file count
+        if len(files) == 0:
+            return error_response("No files provided", status_code=400)
+        
+        if len(files) > 10:
+            return error_response(
+                "Maximum 10 files allowed per batch",
+                detail=f"You provided {len(files)} files",
+                status_code=400
+            )
+        
+        # Validate each file extension
+        allowed = [".pdf", ".docx"]
+        filenames = []
+        files_data = []
+        
+        for file in files:
+            ext = os.path.splitext(file.filename)[1].lower()
+            if ext not in allowed:
+                return error_response(
+                    f"Unsupported file type: {file.filename}",
+                    detail="Only PDF and DOCX files are supported",
+                    status_code=400
+                )
+            
+            # Read file bytes
+            file_bytes = await file.read()
+            
+            # Validate file size
+            max_bytes = settings.max_file_size_mb * 1024 * 1024
+            if len(file_bytes) > max_bytes:
+                return error_response(
+                    f"File too large: {file.filename}",
+                    detail=f"Max size is {settings.max_file_size_mb}MB",
+                    status_code=413
+                )
+            
+            filenames.append(file.filename)
+            files_data.append({
+                "filename": file.filename,
+                "file_bytes": file_bytes,
+                "extension": ext
+            })
+        
+        # Create batch ID and tracker
+        batch_id = str(uuid.uuid4())
+        batch = create_batch(batch_id, filenames)
+        
+        logger.info(f"[BULK] Created batch: {batch_id[:8]}...")
+        logger.info(f"[BULK] Files: {filenames}")
+        print(f"[BULK] Created batch: {batch_id[:8]}...")
+        print(f"[BULK] Files: {filenames}")
+        
+        # Start background processing
+        background_tasks.add_task(
+            orchestrator_service.process_bulk_resumes,
+            batch_id,
+            files_data
+        )
+        
+        return success_response({
+            "batch_id": batch_id,
+            "message": f"Batch created. Processing {len(files)} files in background.",
+            "total_files": len(files),
+            "filenames": filenames,
+            "status_url": f"/resume/bulk-status/{batch_id}",
+            "note": "Processing takes 10-15 seconds per file. Check status_url for progress."
+        }, status_code=202)
+        
+    except ValueError as e:
+        return error_response(str(e), status_code=400)
+    except Exception as e:
+        logger.error(f"Unexpected error in /resume/bulk-upload: {e}")
+        return error_response("Internal server error", detail=str(e), status_code=500)
+
+
+@router.get(
+    "/bulk-status/{batch_id}",
+    response_model=SuccessResponse,
+    responses={404: {"model": ErrorResponse}}
+)
+async def get_bulk_status(batch_id: str):
+    """
+    Get the current processing status of a bulk upload batch.
+    Poll this endpoint every 10 seconds to track progress.
+    
+    Parameters:
+        batch_id: The batch ID returned from /resume/bulk-upload
+        
+    Returns:
+        Success response with batch status, file list, and progress percentage
+    """
+    from utils.bulk_tracker import load_batch
+    
+    try:
+        batch = load_batch(batch_id)
+        
+        if not batch:
+            return error_response(
+                "Batch not found",
+                detail=f"No batch found with ID: {batch_id}",
+                status_code=404
+            )
+        
+        # Calculate progress percentage
+        done = batch["completed"] + batch["failed"]
+        total = batch["total_files"]
+        progress_pct = round((done / total) * 100) if total > 0 else 0
+        
+        logger.info(f"[BULK STATUS] Batch {batch_id[:8]}...")
+        logger.info(f"[BULK STATUS] Progress: {done}/{total} ({progress_pct}%)")
+        print(f"[BULK STATUS] Batch {batch_id[:8]}...")
+        print(f"[BULK STATUS] Progress: {done}/{total} ({progress_pct}%)")
+        
+        return success_response({
+            "batch_id": batch_id,
+            "status": batch["status"],
+            "progress_percent": progress_pct,
+            "total_files": total,
+            "completed": batch["completed"],
+            "failed": batch["failed"],
+            "pending": total - done,
+            "created_at": batch["created_at"],
+            "finished_at": batch.get("finished_at"),
+            "files": batch["files"]
+        })
+        
+    except Exception as e:
+        logger.error(f"Error getting bulk status: {e}")
+        return error_response("Internal server error", detail=str(e), status_code=500)

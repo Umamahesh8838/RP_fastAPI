@@ -8,6 +8,7 @@ Includes timing instrumentation for the main public entrypoints:
 
 import logging
 import time
+import asyncio
 from datetime import datetime
 from typing import Dict, Any
 
@@ -491,18 +492,28 @@ async def parse_resume_preview(db: AsyncSession, file_bytes: bytes, filename: st
 	parsed_dict = parsed.model_dump() if hasattr(parsed, "model_dump") else parsed
 	print(f"[TIMING] LLM total: {llm_elapsed:.2f} seconds (Pass1={t_pass1:.2f}s, Pass2={t_pass2:.2f}s)")
 
-	# STEP 4 — Cache save
+	# STEP 4 — Calculate quality score
+	from utils.quality_score import calculate_resume_quality
+	
+	quality = calculate_resume_quality(parsed_dict)
+	print(f"[QUALITY] Resume score: {quality['score']}/100")
+	print(f"[QUALITY] Grade: {quality['grade']} - {quality['grade_label']}")
+	
+	# STEP 5 — Cache save
 	cache_data = {
 		"resume_hash": resume_hash,
 		"already_exists": already_exists,
 		"parsed": parsed_dict,
+		"quality": quality
 	}
 	step_start = time.time()
 	cache_utils.save_to_cache(resume_hash, cache_data)
 	t_cache = time.time() - step_start
 	print(f"[TIMING] Cache save: {t_cache:.2f} seconds")
 
+	# Calculate total elapsed time
 	total_elapsed = time.perf_counter() - overall_start
+
 	print("=" * 50)
 	print("[TIMING SUMMARY]")
 	print(f"  Text extraction : {t_extract:.2f}s")
@@ -514,7 +525,12 @@ async def parse_resume_preview(db: AsyncSession, file_bytes: bytes, filename: st
 	print("=" * 50)
 
 	logger.info("Preview pipeline complete")
-	return cache_data
+	return {
+		"resume_hash": resume_hash,
+		"already_exists": already_exists,
+		"parsed": parsed_dict,
+		"quality": quality
+	}
 
 
 # ---------------------------------------------------------------------------
@@ -828,4 +844,124 @@ async def save_confirmed_resume(db: AsyncSession, resume_hash: str, parsed: Pars
 		"summary": summary,
 		"warnings": warnings,
 	}
+
+
+# ---------------------------------------------------------------------------
+# Bulk processing
+# ---------------------------------------------------------------------------
+async def process_bulk_resumes(
+    batch_id: str,
+    files_data: list
+):
+    """
+    Processes multiple resume files one by one in background.
+    Updates batch tracking status after each file.
+    
+    Parameters:
+        batch_id: the batch ID created by create_batch()
+        files_data: list of dicts with keys:
+            - filename: str
+            - file_bytes: bytes
+            - extension: str (.pdf or .docx)
+    """
+    from utils.bulk_tracker import update_file_status
+    from utils.quality_score import calculate_resume_quality
+    from utils.hash_utils import compute_resume_hash
+    from utils.cache_utils import save_to_cache, load_from_cache
+    from services.extract_service import (
+        extract_text_from_pdf,
+        extract_text_from_docx
+    )
+    from services.llm_service import parse_resume_text
+    
+    logger.info(f"[BULK] Starting batch {batch_id[:8]}...")
+    logger.info(f"[BULK] Total files: {len(files_data)}")
+    print(f"[BULK] Starting batch {batch_id[:8]}...")
+    print(f"[BULK] Total files: {len(files_data)}")
+    
+    for i, file_info in enumerate(files_data):
+        filename = file_info["filename"]
+        file_bytes = file_info["file_bytes"]
+        extension = file_info["extension"]
+        
+        logger.info(f"[BULK] Processing file {i+1}/{len(files_data)}: {filename}")
+        print(f"[BULK] Processing file {i+1}/{len(files_data)}: {filename}")
+        
+        # Mark as processing
+        update_file_status(batch_id, filename, "processing")
+        
+        try:
+            # Step 1: Extract text
+            if extension == ".pdf":
+                extract_result = await extract_text_from_pdf(file_bytes)
+            elif extension == ".docx":
+                extract_result = await extract_text_from_docx(file_bytes)
+            else:
+                raise ValueError(f"Unsupported file type: {extension}")
+            
+            resume_text = extract_result["text"]
+            
+            # Step 2: Check duplicate
+            resume_hash = compute_resume_hash(resume_text)
+            cached = load_from_cache(resume_hash)
+            
+            if cached:
+                logger.info(f"[BULK] Cache hit for {filename} - skipping LLM")
+                print(f"[BULK] Cache hit for {filename} - skipping LLM")
+                parsed_dict = cached["parsed"]
+                already_exists = True
+            else:
+                # Step 3: Parse with LLM
+                logger.info(f"[BULK] Parsing {filename} with LLM...")
+                print(f"[BULK] Parsing {filename} with LLM...")
+                parsed_result = await parse_resume_text(resume_text)
+                parsed_dict = parsed_result.model_dump()
+                already_exists = False
+            
+            # Step 4: Calculate quality
+            quality = calculate_resume_quality(parsed_dict)
+            
+            # Step 5: Save to cache (if not already cached)
+            if not cached:
+                cache_data = {
+                    "resume_hash": resume_hash,
+                    "already_exists": already_exists,
+                    "parsed": parsed_dict,
+                    "quality": quality
+                }
+                save_to_cache(resume_hash, cache_data)
+            
+            # Update tracker as complete
+            update_file_status(
+                batch_id=batch_id,
+                filename=filename,
+                status="complete",
+                resume_hash=resume_hash,
+                student_name=f"{parsed_dict.get('first_name', '')} {parsed_dict.get('last_name', '')}".strip(),
+                email=parsed_dict.get("email", ""),
+                quality_score=quality["score"]
+            )
+            
+            logger.info(f"[BULK] ✓ {filename} done - Score: {quality['score']}/100")
+            print(f"[BULK] ✓ {filename} done - Score: {quality['score']}/100")
+            
+        except Exception as e:
+            error_msg = str(e)[:200]
+            logger.error(f"[BULK] ✗ {filename} failed: {error_msg}")
+            print(f"[BULK] ✗ {filename} failed: {error_msg}")
+            update_file_status(
+                batch_id=batch_id,
+                filename=filename,
+                status="failed",
+                error=error_msg
+            )
+        
+        # Small delay between files to avoid LLM rate limits
+        if i < len(files_data) - 1:
+            logger.info(f"[BULK] Waiting 3s before next file...")
+            print(f"[BULK] Waiting 3s before next file...")
+            await asyncio.sleep(3)
+    
+    logger.info(f"[BULK] Batch {batch_id[:8]}... finished processing all files")
+    print(f"[BULK] Batch {batch_id[:8]}... finished processing all files")
 

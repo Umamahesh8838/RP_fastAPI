@@ -1,5 +1,6 @@
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 from typing import Optional, List
+import re
 
 
 class SchoolItem(BaseModel):
@@ -33,6 +34,84 @@ class EducationItem(BaseModel):
     end_year: Optional[int] = None           # null if currently studying
     cgpa: Optional[float] = None
     percentage: Optional[float] = None       # fill only if explicitly stated
+
+    @model_validator(mode='before')
+    @classmethod
+    def normalize_years_payload(cls, data):
+        """Normalize year-like values before field-level parsing."""
+        if not isinstance(data, dict):
+            return data
+
+        for year_field in ['start_year', 'end_year']:
+            val = data.get(year_field)
+            if val is None or isinstance(val, int):
+                continue
+
+            if isinstance(val, str):
+                s = val.strip()
+                if not s:
+                    data[year_field] = None
+                    continue
+                m = re.search(r'(\d{4})', s)
+                if m:
+                    try:
+                        data[year_field] = int(m.group(1))
+                        continue
+                    except (ValueError, TypeError):
+                        data[year_field] = None
+                        continue
+                try:
+                    data[year_field] = int(s)
+                except (ValueError, TypeError):
+                    data[year_field] = None
+                continue
+
+            try:
+                s = str(val).strip()
+                m = re.search(r'(\d{4})', s)
+                data[year_field] = int(m.group(1)) if m else int(s)
+            except (ValueError, TypeError, AttributeError):
+                data[year_field] = None
+
+        return data
+
+    @field_validator('start_year', 'end_year', mode='before')
+    @classmethod
+    def clean_years(cls, v):
+        # None is OK
+        if v is None:
+            return None
+        # Already an integer
+        if isinstance(v, int):
+            return v
+        # String - extract year
+        if isinstance(v, str):
+            v = v.strip()
+            if not v:
+                return None
+            # Try to extract first 4-digit year (handles "2026-01-01" or "2026")
+            import re
+            m = re.search(r'(\d{4})', v)
+            if m:
+                try:
+                    return int(m.group(1))
+                except (ValueError, TypeError):
+                    return None
+            # Fallback: try direct int conversion
+            try:
+                return int(v)
+            except (ValueError, TypeError):
+                return None
+        # For other types, convert to string and try
+        try:
+            s = str(v).strip()
+            import re
+            m = re.search(r'(\d{4})', s)
+            if m:
+                return int(m.group(1))
+            return int(s)
+        except (ValueError, TypeError, AttributeError):
+            return None
 
     @field_validator('cgpa', 'percentage', mode='before')
     @classmethod
@@ -146,6 +225,64 @@ class ParsedResume(BaseModel):
     certifications: List[CertificationItem] = []
     interests: List[InterestItem] = []
     addresses: List[AddressItem] = []
+
+    @field_validator('education', mode='before')
+    @classmethod
+    def normalize_education_before(cls, v):
+        """Pre-process education list to ensure years are integers before nested model validation."""
+        if not isinstance(v, list):
+            return v
+        
+        for edu in v:
+            if not isinstance(edu, dict):
+                continue
+            
+            for year_field in ['start_year', 'end_year']:
+                val = edu.get(year_field)
+                if val is None:
+                    continue
+                if isinstance(val, int):
+                    continue
+                if isinstance(val, str):
+                    s = val.strip()
+                    if not s:
+                        edu[year_field] = None
+                        continue
+                    m = re.search(r'(\d{4})', s)
+                    if m:
+                        try:
+                            edu[year_field] = int(m.group(1))
+                        except (ValueError, TypeError):
+                            edu[year_field] = None
+                    else:
+                        try:
+                            edu[year_field] = int(s)
+                        except (ValueError, TypeError):
+                            edu[year_field] = None
+                else:
+                    try:
+                        s = str(val).strip()
+                        m = re.search(r'(\d{4})', s)
+                        edu[year_field] = int(m.group(1)) if m else int(s)
+                    except (ValueError, TypeError, AttributeError):
+                        edu[year_field] = None
+        return v
+
+    @model_validator(mode='after')
+    def normalize_education_after(self):
+        """Extra safety: ensure education years are always integers after model construction."""
+        for edu in self.education:
+            for year_field in ['start_year', 'end_year']:
+                val = getattr(edu, year_field, None)
+                if val is not None and not isinstance(val, int):
+                    if isinstance(val, str):
+                        m = re.search(r'(\d{4})', val)
+                        if m:
+                            try:
+                                setattr(edu, year_field, int(m.group(1)))
+                            except (ValueError, TypeError):
+                                setattr(edu, year_field, None)
+        return self
 
 
 class ParseResumeRequest(BaseModel):

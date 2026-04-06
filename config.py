@@ -5,17 +5,9 @@ from functools import lru_cache
 class Settings(BaseSettings):
     """All application settings loaded from .env file."""
 
-    # Anthropic (Legacy - if using cloud API)
-    anthropic_api_key: str = ""
-    claude_model: str = "claude-sonnet-4-20250514"
-    claude_max_tokens: int = 4096
-    claude_temperature: float = 0.0
-
-    # Ollama model (can be local or cloud-qualified name)
-    # To use cloud-hosted model set this to the cloud-qualified model name, e.g. "minimax-m2.7:cloud"
-    ollama_model: str = "minimax-m2.7:cloud"
-    # Base URL for Ollama-compatible API (keep as localhost when using local server)
-    ollama_base_url: str = "http://localhost:11434"
+    # OpenRouter API
+    openrouter_api_key: str = "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"
+    openrouter_model: str = "openai/gpt-3.5-turbo"
 
     # MySQL
     db_host: str = "localhost"

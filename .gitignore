@@ -49,6 +49,7 @@ logs/
 
 # Cache
 resume_cache/
+resume_cache/bulk/
 
 # Temp files
 tmp/
