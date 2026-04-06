@@ -11,7 +11,7 @@ from routers.parse_router import router as parse_router
 from routers.lookup_router import router as lookup_router
 from routers.save_router import router as save_router
 from routers.orchestrator_router import router as orchestrator_router
-from models import *  # noqa: F401,F403 - ensure model metadata is registered
+from models.master_model import ResumeHash
 import logging
 from config import get_settings
 
@@ -26,13 +26,14 @@ SERVER_START_TIME = time.time()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Runs on startup and shutdown."""
-    # Startup: ensure schema exists for all registered SQLAlchemy models.
+    # Startup: ensure the resume hash table exists (used by parse-preview duplicate checks).
     try:
         async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-        logger.info("Startup complete. Database schema ensured.")
+            await conn.run_sync(lambda sync_conn: ResumeHash.__table__.create(bind=sync_conn, checkfirst=True))
+        logger.info("Startup complete. tbl_cp_resume_hashes ensured.")
     except Exception as e:
         logger.error(f"Error ensuring database schema: {e}")
+        raise
     
     yield
     
