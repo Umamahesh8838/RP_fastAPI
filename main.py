@@ -32,8 +32,8 @@ async def lifespan(app: FastAPI):
             await conn.run_sync(lambda sync_conn: ResumeHash.__table__.create(bind=sync_conn, checkfirst=True))
         logger.info("Startup complete. tbl_cp_resume_hashes ensured.")
     except Exception as e:
-        logger.error(f"Error ensuring database schema: {e}")
-        raise
+        # Log errors but don't fail startup - the table will be auto-created on first use
+        logger.warning(f"Warning during startup schema creation: {e}. Table will be created on first use.")
     
     yield
     
