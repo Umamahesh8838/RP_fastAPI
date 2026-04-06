@@ -1,5 +1,6 @@
 from pydantic_settings import BaseSettings
 from functools import lru_cache
+from urllib.parse import quote_plus
 
 
 class Settings(BaseSettings):
@@ -9,7 +10,8 @@ class Settings(BaseSettings):
     openrouter_api_key: str = "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"
     openrouter_model: str = "openai/gpt-3.5-turbo"
 
-    # MySQL
+    # Database
+    db_driver: str = "mysql"  # mysql | mssql
     db_host: str = "localhost"
     db_port: int = 3306
     db_user: str = "root"
@@ -24,8 +26,25 @@ class Settings(BaseSettings):
 
     @property
     def database_url(self) -> str:
-        """Builds async SQLAlchemy connection string for MySQL."""
-        return f"mysql+aiomysql://{self.db_user}:{self.db_password}@{self.db_host}:{self.db_port}/{self.db_name}"
+        """Builds async SQLAlchemy connection string for configured database engine."""
+        driver = self.db_driver.lower().strip()
+
+        if driver == "mssql":
+            # Azure SQL login usually expects username formatted as user@server.
+            login_user = self.db_user
+            if "@" not in login_user and self.db_host:
+                login_user = f"{login_user}@{self.db_host.split('.')[0]}"
+
+            user = quote_plus(login_user)
+            password = quote_plus(self.db_password)
+            return (
+                f"mssql+aioodbc://{user}:{password}@{self.db_host}:{self.db_port}/{self.db_name}"
+                "?driver=ODBC+Driver+18+for+SQL+Server&Encrypt=yes&TrustServerCertificate=yes"
+            )
+
+        mysql_user = quote_plus(self.db_user)
+        mysql_password = quote_plus(self.db_password)
+        return f"mysql+aiomysql://{mysql_user}:{mysql_password}@{self.db_host}:{self.db_port}/{self.db_name}"
 
     @property
     def allowed_extensions_list(self) -> list[str]:
