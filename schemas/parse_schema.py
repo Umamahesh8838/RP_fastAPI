@@ -284,6 +284,55 @@ class ParsedResume(BaseModel):
                                 setattr(edu, year_field, None)
         return self
 
+    @model_validator(mode='before')
+    @classmethod
+    def normalize_lists_before_validation(cls, data):
+        """Convert string items in lists to proper objects before Pydantic validation."""
+        if not isinstance(data, dict):
+            return data
+        
+        # Convert string->InterestItem
+        if 'interests' in data and isinstance(data['interests'], list):
+            normalized = []
+            for item in data['interests']:
+                if isinstance(item, str):
+                    normalized.append({"name": item, "is_inferred": False})
+                else:
+                    normalized.append(item)
+            data['interests'] = normalized
+        
+        # Convert string->SkillItem
+        if 'skills' in data and isinstance(data['skills'], list):
+            normalized = []
+            for item in data['skills']:
+                if isinstance(item, str):
+                    normalized.append({"name": item, "complexity": None})
+                else:
+                    normalized.append(item)
+            data['skills'] = normalized
+        
+        # Convert string->LanguageItem
+        if 'languages' in data and isinstance(data['languages'], list):
+            normalized = []
+            for item in data['languages']:
+                if isinstance(item, str):
+                    normalized.append({"language_name": item})
+                else:
+                    normalized.append(item)
+            data['languages'] = normalized
+        
+        # Convert string->CertificationItem
+        if 'certifications' in data and isinstance(data['certifications'], list):
+            normalized = []
+            for item in data['certifications']:
+                if isinstance(item, str):
+                    normalized.append({"certification_name": item})
+                else:
+                    normalized.append(item)
+            data['certifications'] = normalized
+        
+        return data
+
 
 class ParseResumeRequest(BaseModel):
     """Request body for /parse/resume endpoint."""
