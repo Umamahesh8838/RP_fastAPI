@@ -14,7 +14,8 @@ from typing import Dict, Any
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import OperationalError, ProgrammingError
+from config import get_settings
 
 from schemas.parse_schema import ParsedResume
 from schemas.student_schema import SaveStudentRequest
@@ -27,6 +28,49 @@ from utils import cache_utils
 from services import extract_service, llm_service, lookup_service, save_service
 
 logger = logging.getLogger(__name__)
+settings = get_settings()
+
+
+def _is_missing_resume_hash_table_error(err: Exception) -> bool:
+	err_text = str(err).lower()
+	return (
+		"42s02" in err_text
+		or "invalid object name 'tbl_cp_resume_hashes'" in err_text
+		or "no such table" in err_text
+	)
+
+
+async def _ensure_resume_hash_table(db: AsyncSession) -> None:
+	"""Ensure tbl_cp_resume_hashes exists across supported database engines."""
+	driver = (settings.db_driver or "mysql").lower().strip()
+	if driver == "mssql":
+		await db.execute(
+			text(
+				"""
+				IF OBJECT_ID('dbo.tbl_cp_resume_hashes', 'U') IS NULL
+				BEGIN
+					CREATE TABLE dbo.tbl_cp_resume_hashes (
+						hash VARCHAR(64) NOT NULL PRIMARY KEY,
+						student_id INT NOT NULL,
+						created_at DATETIME2 DEFAULT SYSUTCDATETIME()
+					)
+				END
+				"""
+			)
+		)
+	else:
+		await db.execute(
+			text(
+				"""
+				CREATE TABLE IF NOT EXISTS tbl_cp_resume_hashes (
+					hash VARCHAR(64) NOT NULL PRIMARY KEY,
+					student_id INT NOT NULL,
+					created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+				)
+				"""
+			)
+		)
+	await db.commit()
 
 
 async def _execute_with_db_retry(db: AsyncSession, sql_text, params: dict, retries: int = 3):
@@ -47,6 +91,48 @@ async def _execute_with_db_retry(db: AsyncSession, sql_text, params: dict, retri
 			await asyncio.sleep(wait_s)
 
 	raise last_err
+
+
+async def _find_existing_resume_hash(db: AsyncSession, resume_hash: str):
+	"""Return existing hash row and auto-heal missing table if needed."""
+	try:
+		result = await _execute_with_db_retry(
+			db,
+			text("SELECT student_id FROM tbl_cp_resume_hashes WHERE hash = :hash"),
+			{"hash": resume_hash},
+		)
+		return result.fetchone()
+	except ProgrammingError as e:
+		if not _is_missing_resume_hash_table_error(e):
+			raise
+		logger.warning("tbl_cp_resume_hashes missing. Creating table and retrying hash lookup.")
+		await _ensure_resume_hash_table(db)
+		result = await _execute_with_db_retry(
+			db,
+			text("SELECT student_id FROM tbl_cp_resume_hashes WHERE hash = :hash"),
+			{"hash": resume_hash},
+		)
+		return result.fetchone()
+
+
+async def _save_resume_hash(db: AsyncSession, resume_hash: str, student_id: int) -> None:
+	"""Insert resume hash and auto-heal missing table if needed."""
+	try:
+		await db.execute(
+			text("INSERT INTO tbl_cp_resume_hashes (hash, student_id) VALUES (:hash, :student_id)"),
+			{"hash": resume_hash, "student_id": student_id},
+		)
+		await db.commit()
+	except ProgrammingError as e:
+		if not _is_missing_resume_hash_table_error(e):
+			raise
+		logger.warning("tbl_cp_resume_hashes missing during insert. Creating table and retrying.")
+		await _ensure_resume_hash_table(db)
+		await db.execute(
+			text("INSERT INTO tbl_cp_resume_hashes (hash, student_id) VALUES (:hash, :student_id)"),
+			{"hash": resume_hash, "student_id": student_id},
+		)
+		await db.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -97,12 +183,7 @@ async def run_full_pipeline(db: AsyncSession, file_bytes: bytes, filename: str) 
 	step_start = time.time()
 	try:
 		resume_hash = compute_resume_hash(resume_text)
-		result = await _execute_with_db_retry(
-			db,
-			text("SELECT student_id FROM tbl_cp_resume_hashes WHERE hash = :hash"),
-			{"hash": resume_hash},
-		)
-		existing_hash = result.fetchone()
+		existing_hash = await _find_existing_resume_hash(db, resume_hash)
 		t_hash = time.time() - step_start
 		print(f"[TIMING] Hash check: {t_hash:.2f} seconds")
 
@@ -409,11 +490,7 @@ async def run_full_pipeline(db: AsyncSession, file_bytes: bytes, filename: str) 
 	# STEP 14 — Store resume hash
 	logger.info("STEP 14 — Store resume hash")
 	try:
-		await db.execute(
-			text("INSERT INTO tbl_cp_resume_hashes (hash, student_id) VALUES (:hash, :student_id)"),
-			{"hash": resume_hash, "student_id": student_id},
-		)
-		await db.commit()
+		await _save_resume_hash(db, resume_hash, student_id)
 	except Exception as e:
 		logger.warning(f"Resume hash storage failed: {e}")
 		warnings.append(f"Resume hash storage failed: {e}")
@@ -478,12 +555,7 @@ async def parse_resume_preview(db: AsyncSession, file_bytes: bytes, filename: st
 	step_start = time.time()
 	try:
 		resume_hash = compute_resume_hash(resume_text)
-		result = await _execute_with_db_retry(
-			db,
-			text("SELECT student_id FROM tbl_cp_resume_hashes WHERE hash = :hash"),
-			{"hash": resume_hash},
-		)
-		existing_hash = result.fetchone()
+		existing_hash = await _find_existing_resume_hash(db, resume_hash)
 		already_exists = existing_hash is not None
 		t_hash = time.time() - step_start
 		print(f"[TIMING] Hash check: {t_hash:.2f} seconds")
@@ -580,11 +652,7 @@ async def save_confirmed_resume(db: AsyncSession, resume_hash: str, parsed: Pars
 		parsed = ParsedResume(**parsed)
 
 	try:
-		result = await db.execute(
-			text("SELECT student_id FROM tbl_cp_resume_hashes WHERE hash = :hash"),
-			{"hash": resume_hash},
-		)
-		existing = result.fetchone()
+		existing = await _find_existing_resume_hash(db, resume_hash)
 		already_existed = existing is not None
 	except Exception as e:
 		logger.warning(f"Hash pre-check failed: {e}")
@@ -851,11 +919,7 @@ async def save_confirmed_resume(db: AsyncSession, resume_hash: str, parsed: Pars
 
 	# STEP 14 — Store resume hash
 	try:
-		await db.execute(
-			text("INSERT INTO tbl_cp_resume_hashes (hash, student_id) VALUES (:hash, :student_id)"),
-			{"hash": resume_hash, "student_id": student_id},
-		)
-		await db.commit()
+		await _save_resume_hash(db, resume_hash, student_id)
 	except Exception as e:
 		logger.warning(f"Resume hash storage failed: {e}")
 		warnings.append(f"Resume hash storage failed: {e}")
