@@ -5,11 +5,11 @@ from .workexp_model import StudentWorkExp
 from .project_model import StudentProject
 from .address_model import StudentAddress
 from .m2m_model import (
-	StudentSkill,
-	StudentLanguage,
-	StudentInterest,
-	StudentCertification,
-	StudentProjectSkill,
+	M2MStudentSkill,
+	M2MStudentLanguage,
+	M2MStudentInterest,
+	M2MStudentCertification,
+	M2MProjectSkill,
 )
 from .master_model import (
 	MasterSalutation,
@@ -33,11 +33,11 @@ __all__ = [
 	"StudentWorkExp",
 	"StudentProject",
 	"StudentAddress",
-	"StudentSkill",
-	"StudentLanguage",
-	"StudentInterest",
-	"StudentCertification",
-	"StudentProjectSkill",
+	"M2MStudentSkill",
+	"M2MStudentLanguage",
+	"M2MStudentInterest",
+	"M2MStudentCertification",
+	"M2MProjectSkill",
 	"MasterSalutation",
 	"MasterLanguage",
 	"MasterInterest",
