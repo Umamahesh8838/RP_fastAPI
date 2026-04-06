@@ -26,14 +26,8 @@ SERVER_START_TIME = time.time()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Runs on startup and shutdown."""
-    # Startup: ensure the resume hash table exists (used by parse-preview duplicate checks).
-    try:
-        async with engine.begin() as conn:
-            await conn.run_sync(lambda sync_conn: ResumeHash.__table__.create(bind=sync_conn, checkfirst=True))
-        logger.info("Startup complete. tbl_cp_resume_hashes ensured.")
-    except Exception as e:
-        # Log errors but don't fail startup - the table will be auto-created on first use
-        logger.warning(f"Warning during startup schema creation: {e}. Table will be created on first use.")
+    # Startup: just log that we're starting
+    logger.info("Application starting up...")
     
     yield
     
