@@ -14,6 +14,7 @@ from typing import Dict, Any
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import OperationalError
 
 from schemas.parse_schema import ParsedResume
 from schemas.student_schema import SaveStudentRequest
@@ -26,6 +27,26 @@ from utils import cache_utils
 from services import extract_service, llm_service, lookup_service, save_service
 
 logger = logging.getLogger(__name__)
+
+
+async def _execute_with_db_retry(db: AsyncSession, sql_text, params: dict, retries: int = 3):
+	"""Retry transient DB connection timeouts (common with Azure SQL serverless cold starts)."""
+	last_err = None
+	for attempt in range(1, retries + 1):
+		try:
+			return await db.execute(sql_text, params)
+		except OperationalError as e:
+			last_err = e
+			err_text = str(e).lower()
+			if "hyt00" not in err_text and "login timeout expired" not in err_text:
+				raise
+			if attempt >= retries:
+				break
+			wait_s = attempt * 5
+			logger.warning(f"Transient DB timeout detected. Retrying in {wait_s}s (attempt {attempt}/{retries})")
+			await asyncio.sleep(wait_s)
+
+	raise last_err
 
 
 # ---------------------------------------------------------------------------
@@ -76,7 +97,8 @@ async def run_full_pipeline(db: AsyncSession, file_bytes: bytes, filename: str) 
 	step_start = time.time()
 	try:
 		resume_hash = compute_resume_hash(resume_text)
-		result = await db.execute(
+		result = await _execute_with_db_retry(
+			db,
 			text("SELECT student_id FROM tbl_cp_resume_hashes WHERE hash = :hash"),
 			{"hash": resume_hash},
 		)
@@ -456,7 +478,8 @@ async def parse_resume_preview(db: AsyncSession, file_bytes: bytes, filename: st
 	step_start = time.time()
 	try:
 		resume_hash = compute_resume_hash(resume_text)
-		result = await db.execute(
+		result = await _execute_with_db_retry(
+			db,
 			text("SELECT student_id FROM tbl_cp_resume_hashes WHERE hash = :hash"),
 			{"hash": resume_hash},
 		)

@@ -39,7 +39,10 @@ class Settings(BaseSettings):
             password = quote_plus(self.db_password)
             return (
                 f"mssql+aioodbc://{user}:{password}@{self.db_host}:{self.db_port}/{self.db_name}"
-                "?driver=ODBC+Driver+18+for+SQL+Server&Encrypt=yes&TrustServerCertificate=yes"
+                "?driver=ODBC+Driver+18+for+SQL+Server"
+                "&Encrypt=yes"
+                "&TrustServerCertificate=yes"
+                "&Connection+Timeout=120"
             )
 
         mysql_user = quote_plus(self.db_user)
