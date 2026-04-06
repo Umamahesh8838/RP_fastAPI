@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from sqlalchemy import text
-from database import engine, AsyncSessionLocal
+from database import engine, AsyncSessionLocal, Base
 import time
 import os
 from datetime import datetime
@@ -11,6 +11,7 @@ from routers.parse_router import router as parse_router
 from routers.lookup_router import router as lookup_router
 from routers.save_router import router as save_router
 from routers.orchestrator_router import router as orchestrator_router
+from models import *  # noqa: F401,F403 - ensure model metadata is registered
 import logging
 from config import get_settings
 
@@ -25,20 +26,13 @@ SERVER_START_TIME = time.time()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Runs on startup and shutdown."""
-    # Startup: create tbl_cp_resume_hashes if not exists
+    # Startup: ensure schema exists for all registered SQLAlchemy models.
     try:
-        async with AsyncSessionLocal() as db:
-            await db.execute(text("""
-                CREATE TABLE IF NOT EXISTS tbl_cp_resume_hashes (
-                    hash       VARCHAR(64)  NOT NULL PRIMARY KEY,
-                    student_id INT          NOT NULL,
-                    created_at DATETIME     DEFAULT CURRENT_TIMESTAMP
-                )
-            """))
-            await db.commit()
-        logger.info("Startup complete. tbl_cp_resume_hashes ensured.")
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        logger.info("Startup complete. Database schema ensured.")
     except Exception as e:
-        logger.error(f"Error creating resume_hashes table: {e}")
+        logger.error(f"Error ensuring database schema: {e}")
     
     yield
     
