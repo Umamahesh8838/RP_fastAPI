@@ -11,9 +11,10 @@ from routers.parse_router import router as parse_router
 from routers.lookup_router import router as lookup_router
 from routers.save_router import router as save_router
 from routers.orchestrator_router import router as orchestrator_router
-from models.master_model import ResumeHash
+from models import *  # Import all models so they're registered with Base metadata
 import logging
 from config import get_settings
+from database import Base
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -26,8 +27,16 @@ SERVER_START_TIME = time.time()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Runs on startup and shutdown."""
-    # Startup: just log that we're starting
+    # Startup: create all tables defined in models
     logger.info("Application starting up...")
+    try:
+        async with engine.begin() as conn:
+            # Create all tables from SQLAlchemy models
+            await conn.run_sync(Base.metadata.create_all)
+        logger.info("✓ All database tables created/verified successfully.")
+    except Exception as e:
+        # Log errors but don't fail startup - tables may already exist
+        logger.warning(f"Schema creation warning (may be OK if tables already exist): {e}")
     
     yield
     
