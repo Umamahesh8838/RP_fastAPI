@@ -27,19 +27,8 @@ SERVER_START_TIME = time.time()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Runs on startup and shutdown."""
-    # Startup: create all tables defined in models
-    logger.info("Application starting up...")
-    try:
-        async with engine.begin() as conn:
-            # Create all tables from SQLAlchemy models
-            await conn.run_sync(Base.metadata.create_all)
-        logger.info("✓ All database tables created/verified successfully.")
-    except Exception as e:
-        # Log errors but don't fail startup - tables may already exist
-        logger.warning(f"Schema creation warning (may be OK if tables already exist): {e}")
-    
+    logger.info("✓ Application started successfully!")
     yield
-    
     # Shutdown
     await engine.dispose()
     logger.info("Shutdown complete.")
@@ -236,3 +225,30 @@ async def root():
         "docs_url": "/docs",
         "redoc_url": "/redoc"
     }
+
+
+@app.post("/admin/init-database")
+async def init_database():
+    """
+    Initialize the database schema.
+    Creates all tables from SQLAlchemy models.
+    Safe to call multiple times - idempotent.
+    """
+    try:
+        logger.info("Initializing database schema...")
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        logger.info("✓ Database schema initialized successfully!")
+        return {
+            "status": "success",
+            "message": "All tables created or verified",
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Error initializing database: {e}")
+        return {
+            "status": "error",
+            "message": str(e),
+            "timestamp": datetime.now().isoformat()
+        }
+
