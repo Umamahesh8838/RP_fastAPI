@@ -52,17 +52,41 @@ if settings.db_driver == "mssql":
 try:
     logger.info("Creating async SQLAlchemy engine...")
     
-    engine = create_async_engine(
-        settings.database_url,
-        echo=False,
-        pool_pre_ping=True,
-        poolclass=NullPool if settings.db_driver == "mssql" else None,
-        pool_size=5,
-        max_overflow=10,
-    )
+    # For MSSQL with pyodbc: Use NullPool (no connection pooling)
+    # NullPool creates a new connection for each request and closes it
+    # This is optimal for Azure SQL and doesn't support pool_size/max_overflow
+    if settings.db_driver == "mssql":
+        logger.info("  Using NullPool for Azure SQL Server (no connection pooling)")
+        engine = create_async_engine(
+            settings.database_url,
+            echo=False,
+            poolclass=NullPool,
+            # NullPool parameters: connect_args only
+            connect_args={
+                "timeout": 30,
+                "check_same_thread": False,
+            }
+        )
+    else:
+        # For other databases (e.g., MySQL), use default pool with connection pooling
+        logger.info("  Using default connection pool")
+        engine = create_async_engine(
+            settings.database_url,
+            echo=False,
+            pool_pre_ping=True,
+            pool_size=5,
+            max_overflow=10,
+        )
     
     logger.info("✓ Async engine created successfully")
-    logger.info(f"  Connection string: {settings.database_url[:80]}...")
+    logger.info(f"  Connection string: mssql+pyodbc://***@{settings.db_host}:{settings.db_port}/{settings.db_name}")
+    
+except TypeError as e:
+    logger.error(f"✗ SQLAlchemy engine configuration error: {e}")
+    logger.error("  This typically means incompatible parameters for the selected pool class")
+    logger.error("  Check: pool_size and max_overflow are only valid with connection pooling")
+    logger.error("         Not valid with NullPool or other non-pooling pool classes")
+    sys.exit(1)
     
 except Exception as e:
     logger.error(f"✗ Failed to create engine: {e}", exc_info=True)
