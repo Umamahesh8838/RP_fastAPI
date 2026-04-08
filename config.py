@@ -31,11 +31,12 @@ class Settings(BaseSettings):
         driver = self.db_driver.lower().strip()
 
         if driver == "mssql":
-            # Azure SQL connection string with pyodbc driver
+            # Azure SQL async connection string with aioodbc driver
+            # aioodbc provides async wrapper around pyodbc for SQL Server
             user = quote_plus(self.db_user)
             password = quote_plus(self.db_password)
             connection_string = (
-                f"mssql+pyodbc://{user}:{password}@{self.db_host}:{self.db_port}/{self.db_name}"
+                f"mssql+aioodbc://{user}:{password}@{self.db_host}:{self.db_port}/{self.db_name}"
                 "?driver=ODBC+Driver+18+for+SQL+Server"
                 "&Encrypt=yes"
                 "&TrustServerCertificate=no"

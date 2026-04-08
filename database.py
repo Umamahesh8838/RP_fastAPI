@@ -50,46 +50,53 @@ if settings.db_driver == "mssql":
 # CREATE ASYNC ENGINE FOR AZURE SQL
 # ──────────────────────────────────────────────────────────
 try:
-    logger.info("Creating async SQLAlchemy engine...")
+    logger.info("Creating async SQLAlchemy engine for Azure SQL...")
     
-    # For MSSQL with pyodbc: Use NullPool (no connection pooling)
-    # NullPool creates a new connection for each request and closes it
-    # This is optimal for Azure SQL and doesn't support pool_size/max_overflow
     if settings.db_driver == "mssql":
-        logger.info("  Using NullPool for Azure SQL Server (no connection pooling)")
+        # For MSSQL with aioodbc: Use aioodbc + pyodbc for true async support
+        # aioodbc wraps pyodbc and provides async/await interface
+        logger.info("  Database driver: SQL Server (aioodbc)")
+        logger.info("  Pool class: NullPool (no connection pooling - optimal for serverless)")
+        
         engine = create_async_engine(
             settings.database_url,
             echo=False,
+            future=True,
             poolclass=NullPool,
-            # NullPool parameters: connect_args only
+            # NullPool-compatible parameters only
             connect_args={
                 "timeout": 30,
                 "check_same_thread": False,
+                "autocommit": False,
             }
         )
     else:
-        # For other databases (e.g., MySQL), use default pool with connection pooling
-        logger.info("  Using default connection pool")
+        # For MySQL with aiomysql: Use default connection pool
+        logger.info("  Database driver: MySQL (aiomysql)")
+        logger.info("  Pool class: Default QueuePool (with connection pooling)")
+        
         engine = create_async_engine(
             settings.database_url,
             echo=False,
+            future=True,
             pool_pre_ping=True,
             pool_size=5,
             max_overflow=10,
         )
     
     logger.info("✓ Async engine created successfully")
-    logger.info(f"  Connection string: mssql+pyodbc://***@{settings.db_host}:{settings.db_port}/{settings.db_name}")
+    logger.info(f"  Connection: {settings.db_driver.upper()}://{settings.db_user}@{settings.db_host}:{settings.db_port}/{settings.db_name}")
     
 except TypeError as e:
-    logger.error(f"✗ SQLAlchemy engine configuration error: {e}")
-    logger.error("  This typically means incompatible parameters for the selected pool class")
-    logger.error("  Check: pool_size and max_overflow are only valid with connection pooling")
-    logger.error("         Not valid with NullPool or other non-pooling pool classes")
+    logger.error(f"✗ Engine configuration TypeError: {e}")
+    logger.error("  Incompatible parameters for the selected pool class")
+    logger.error("  pool_size/max_overflow only valid with connection pooling")
+    logger.error("  With NullPool, use only: connect_args, echo, future, poolclass")
     sys.exit(1)
     
 except Exception as e:
-    logger.error(f"✗ Failed to create engine: {e}", exc_info=True)
+    logger.error(f"✗ Failed to create async engine: {e}", exc_info=True)
+    logger.error("  Check: aioodbc installed? ODBC Driver 18 available?")
     sys.exit(1)
 
 AsyncSessionLocal = async_sessionmaker(
