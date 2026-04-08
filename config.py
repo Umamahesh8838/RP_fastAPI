@@ -11,11 +11,11 @@ class Settings(BaseSettings):
     openrouter_model: str = "openai/gpt-3.5-turbo"
 
     # Database
-    db_driver: str = "mysql"  # mysql | mssql
-    db_host: str = "localhost"
-    db_port: int = 3306
-    db_user: str = "root"
-    db_password: str = ""
+    db_driver: str = "mssql"  # mysql | mssql
+    db_host: str = "artisetsql.database.windows.net"
+    db_port: int = 1433
+    db_user: str = "artiset"
+    db_password: str = "Qwerty@123"
     db_name: str = "campus5"
 
     # App
@@ -30,18 +30,14 @@ class Settings(BaseSettings):
         driver = self.db_driver.lower().strip()
 
         if driver == "mssql":
-            # Azure SQL login usually expects username formatted as user@server.
-            login_user = self.db_user
-            if "@" not in login_user and self.db_host:
-                login_user = f"{login_user}@{self.db_host.split('.')[0]}"
-
-            user = quote_plus(login_user)
+            # Azure SQL connection string with pyodbc driver
+            user = quote_plus(self.db_user)
             password = quote_plus(self.db_password)
             return (
-                f"mssql+aioodbc://{user}:{password}@{self.db_host}:{self.db_port}/{self.db_name}"
+                f"mssql+pyodbc://{user}:{password}@{self.db_host}:{self.db_port}/{self.db_name}"
                 "?driver=ODBC+Driver+18+for+SQL+Server"
                 "&Encrypt=yes"
-                "&TrustServerCertificate=yes"
+                "&TrustServerCertificate=no"
                 "&Connection+Timeout=120"
             )
 

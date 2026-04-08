@@ -1,15 +1,21 @@
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.pool import NullPool
 from config import get_settings
+import logging
 
+logger = logging.getLogger(__name__)
 settings = get_settings()
 
+# For Azure SQL Server with pyodbc, use NullPool for better connection handling
+# This prevents connection pooling issues in serverless environments
 engine = create_async_engine(
     settings.database_url,
     echo=False,
     pool_pre_ping=True,
-    pool_size=10,
-    max_overflow=20
+    poolclass=NullPool if settings.db_driver == "mssql" else None,
+    pool_size=5,
+    max_overflow=10,
 )
 
 AsyncSessionLocal = async_sessionmaker(

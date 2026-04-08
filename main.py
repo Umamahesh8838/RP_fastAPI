@@ -46,17 +46,30 @@ async def favicon():
     from fastapi.responses import Response
     return Response(status_code=204)
 
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
+# Add CORS middleware with Azure Web App support
+settings = get_settings()
+
+# Determine allowed origins based on environment
+if settings.app_env == "production":
+    # For production on Azure, add your actual domain
+    allowed_origins = [
+        "https://your-azure-domain.azurewebsites.net",  # Update with your actual Azure domain
+        "https://*.azurewebsites.net",  # Allow any Azure Web App subdomain for testing
+    ]
+else:
+    # Development environments
+    allowed_origins = [
         "http://localhost:3000",
         "http://localhost:8000",
         "http://localhost:8080",
         "http://127.0.0.1:3000",
         "http://127.0.0.1:8000",
         "http://127.0.0.1:8080",
-    ],
+    ]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
