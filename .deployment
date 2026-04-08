@@ -1,2 +1,6 @@
 [config]
-command = startup.sh
+; Deployment configuration for Azure App Service
+; Use Oryx to automatically detect and build Python app
+
+SCM_DO_BUILD_DURING_DEPLOYMENT=true
+
