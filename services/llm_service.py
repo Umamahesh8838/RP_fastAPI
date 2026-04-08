@@ -16,6 +16,19 @@ OPENROUTER_API_KEY = settings.openrouter_api_key
 OPENROUTER_MODEL = settings.openrouter_model
 OPENROUTER_API_BASE = "https://openrouter.ai/api/v1"
 
+# ──────────────────────────────────────────────────────────
+# VALIDATE OPENROUTER API KEY
+# ──────────────────────────────────────────────────────────
+if not OPENROUTER_API_KEY or OPENROUTER_API_KEY.strip() == "":
+    logger.warning("⚠️  OPENROUTER_API_KEY is not set!")
+    logger.warning("   Set the environment variable: OPENROUTER_API_KEY")
+    logger.warning("   On Azure Portal: Configuration → Application settings → + New application setting")
+    logger.warning("   On Local: Add to .env file: OPENROUTER_API_KEY=sk-or-v1-xxxxx")
+    logger.warning("   Get your key from: https://openrouter.ai/keys")
+else:
+    logger.info(f"✓ OpenRouter API key configured (length: {len(OPENROUTER_API_KEY)})")
+    logger.info(f"✓ Model: {OPENROUTER_MODEL}")
+
 SYSTEM_PROMPT_PASS1 = """
 You are a precise resume data extraction engine.
 Your only job is to read the resume text and return a single JSON object.
@@ -239,8 +252,22 @@ async def _call_openrouter_api(full_prompt: str) -> str:
     Uses httpx.AsyncClient for non-blocking HTTP requests.
     Returns raw text response from the LLM.
     """
+    # ──────────────────────────────────────────────────────────
+    # VALIDATE API KEY BEFORE MAKING REQUEST
+    # ──────────────────────────────────────────────────────────
+    if not OPENROUTER_API_KEY or OPENROUTER_API_KEY.strip() == "":
+        error_msg = (
+            "OpenRouter API key is not configured! "
+            "Set OPENROUTER_API_KEY environment variable. "
+            "Get your key from: https://openrouter.ai/keys"
+        )
+        logger.error(f"[OPENROUTER] {error_msg}")
+        raise ValueError(error_msg)
+    
     print(f"[OPENROUTER] Starting API call...")
     print(f"[OPENROUTER] Prompt length: {len(full_prompt)} chars")
+    print(f"[OPENROUTER] Model: {OPENROUTER_MODEL}")
+    print(f"[OPENROUTER] API Key (first 10 chars): {OPENROUTER_API_KEY[:10]}...")
     
     start = time.time()
     
@@ -269,6 +296,20 @@ async def _call_openrouter_api(full_prompt: str) -> str:
             )
             
             elapsed = time.time() - start
+            
+            if response.status_code == 401:
+                error_text = response.text
+                print(f"[OPENROUTER] AUTHENTICATION ERROR after {elapsed:.2f}s")
+                print(f"[OPENROUTER] Status: 401 Unauthorized")
+                print(f"[OPENROUTER] Response: {error_text}")
+                logger.error(f"[OPENROUTER] Authentication failed (401)")
+                logger.error(f"[OPENROUTER] Check that OPENROUTER_API_KEY is valid")
+                logger.error(f"[OPENROUTER] Get key from: https://openrouter.ai/keys")
+                raise ValueError(
+                    f"OpenRouter authentication failed (401). "
+                    f"Check that OPENROUTER_API_KEY is valid. "
+                    f"Get your key from: https://openrouter.ai/keys"
+                )
             
             if response.status_code != 200:
                 error_text = response.text
