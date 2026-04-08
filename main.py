@@ -13,25 +13,62 @@ from routers.save_router import router as save_router
 from routers.orchestrator_router import router as orchestrator_router
 from models import *  # Import all models so they're registered with Base metadata
 import logging
+import sys
 from config import get_settings
 from database import Base
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# ──────────────────────────────────────────────────────────
+# LOGGING CONFIGURATION FOR AZURE
+# ──────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),  # Ensure logs go to Azure stdout
+        logging.FileHandler("/tmp/app.log", encoding="utf-8") if os.path.exists("/tmp") else logging.NullHandler()
+    ]
+)
 logger = logging.getLogger(__name__)
 
 # Store server start time
 SERVER_START_TIME = time.time()
+settings = get_settings()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Runs on startup and shutdown."""
+    """Runs on startup and shutdown with comprehensive diagnostics."""
+    logger.info("=" * 70)
+    logger.info("🚀 FastAPI Application Startup")
+    logger.info("=" * 70)
+    
+    try:
+        # Test database connection at startup
+        logger.info("Testing database connection...")
+        async with AsyncSessionLocal() as db:
+            await db.execute(text("SELECT 1"))
+        logger.info("✓ Database connection verified!")
+        
+    except Exception as e:
+        logger.error(f"✗ Database connection failed at startup: {e}", exc_info=True)
+        logger.error("⚠️  Application will continue but database operations will fail")
+        logger.error("Common causes:")
+        logger.error("  1. Missing ODBC Driver 18 for SQL Server")
+        logger.error("  2. Incorrect database credentials")
+        logger.error("  3. Firewall blocking connection")
+        logger.error("  4. Azure SQL Server not accessible")
+    
     logger.info("✓ Application started successfully!")
+    logger.info(f"  Environment: {settings.app_env}")
+    logger.info(f"  Database: {settings.db_host}")
+    logger.info("=" * 70)
+    
     yield
+    
     # Shutdown
+    logger.info("Shutting down application...")
     await engine.dispose()
-    logger.info("Shutdown complete.")
+    logger.info("✓ Shutdown complete.")
 
 
 app = FastAPI(
@@ -41,21 +78,33 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+# ──────────────────────────────────────────────────────────
+# Load settings and validate
+# ──────────────────────────────────────────────────────────
+try:
+    settings = get_settings()
+    logger.info(f"✓ Settings loaded from environment")
+except Exception as e:
+    logger.error(f"✗ Failed to load settings: {e}", exc_info=True)
+    sys.exit(1)
+
 @app.get("/favicon.ico", include_in_schema=False)
 async def favicon():
     from fastapi.responses import Response
     return Response(status_code=204)
 
-# Add CORS middleware with Azure Web App support
-settings = get_settings()
+# ──────────────────────────────────────────────────────────
+# CORS CONFIGURATION FOR AZURE
+# ──────────────────────────────────────────────────────────
+logger.info(f"Environment: {settings.app_env}")
 
 # Determine allowed origins based on environment
-if settings.app_env == "production":
+if settings.app_env.lower() == "production":
     # For production on Azure, add your actual domain
     allowed_origins = [
         "https://your-azure-domain.azurewebsites.net",  # Update with your actual Azure domain
-        "https://*.azurewebsites.net",  # Allow any Azure Web App subdomain for testing
     ]
+    logger.warning("⚠️  CORS: Production mode - Update allowed_origins with your Azure domain!")
 else:
     # Development environments
     allowed_origins = [
@@ -66,6 +115,7 @@ else:
         "http://127.0.0.1:8000",
         "http://127.0.0.1:8080",
     ]
+    logger.info(f"CORS: Development mode - allowing localhost origins")
 
 app.add_middleware(
     CORSMiddleware,
