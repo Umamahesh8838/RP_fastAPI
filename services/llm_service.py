@@ -2,7 +2,6 @@ import json
 import re
 import logging
 import time
-import asyncio
 import httpx
 from config import get_settings
 from schemas.parse_schema import ParsedResume
@@ -246,10 +245,10 @@ def clean_and_parse_json(raw_text: str) -> dict:
         )
 
 
-async def _call_openrouter_api(full_prompt: str) -> str:
+def _call_openrouter_api(full_prompt: str) -> str:
     """
-    Async call to OpenRouter API.
-    Uses httpx.AsyncClient for non-blocking HTTP requests.
+    Synchronous call to OpenRouter API.
+    Uses httpx.Client for blocking HTTP requests.
     Returns raw text response from the LLM.
     """
     # ──────────────────────────────────────────────────────────
@@ -288,8 +287,8 @@ async def _call_openrouter_api(full_prompt: str) -> str:
     }
     
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            response = await client.post(
+        with httpx.Client(timeout=120.0) as client:
+            response = client.post(
                 f"{OPENROUTER_API_BASE}/chat/completions",
                 headers=headers,
                 json=payload
@@ -326,7 +325,7 @@ async def _call_openrouter_api(full_prompt: str) -> str:
             
             return message_content
         
-    except asyncio.TimeoutError:
+    except httpx.TimeoutException:
         elapsed = time.time() - start
         print(f"[OPENROUTER] TIMEOUT after {elapsed:.2f}s")
         logger.error(f"[OPENROUTER] Timeout after {elapsed:.2f}s")
@@ -338,18 +337,17 @@ async def _call_openrouter_api(full_prompt: str) -> str:
         raise
 
 
-async def _call_gemini_api(full_prompt: str) -> str:
+def _call_gemini_api(full_prompt: str) -> str:
     """
     DEPRECATED - Use _call_openrouter_api instead.
     This function is kept for backward compatibility but redirects to OpenRouter.
     """
-    return await _call_openrouter_api(full_prompt)
+    return _call_openrouter_api(full_prompt)
 
 
-async def call_llm(system_prompt: str, user_message: str) -> dict:
+def call_llm(system_prompt: str, user_message: str) -> dict:
     """
-    Calls OpenRouter API asynchronously.
-    No blocking calls - fully async/await compatible with FastAPI.
+    Calls OpenRouter API synchronously.
     Includes 120-second timeout protection.
     """
     
@@ -361,15 +359,12 @@ async def call_llm(system_prompt: str, user_message: str) -> dict:
 REMINDER: Return ONLY valid JSON. No explanation. 
 No markdown. No extra text. Pure JSON only."""
 
-    print(f"[OPENROUTER] Calling OpenRouter API (async)...")
+    print(f"[OPENROUTER] Calling OpenRouter API...")
     start_time = time.time()
     
     try:
-        # True async call - no blocking
-        raw_text = await asyncio.wait_for(
-            _call_openrouter_api(full_prompt),
-            timeout=120.0  # 2 minute timeout
-        )
+        # Synchronous call with timeout
+        raw_text = _call_openrouter_api(full_prompt)
         
         elapsed = time.time() - start_time
         print(f"[OPENROUTER] Response received in {elapsed:.2f}s")
@@ -377,15 +372,6 @@ No markdown. No extra text. Pure JSON only."""
         result = clean_and_parse_json(raw_text)
         print(f"[OPENROUTER] JSON parsed successfully")
         return result
-        
-    except asyncio.TimeoutError:
-        elapsed = time.time() - start_time
-        print(f"[OPENROUTER] TIMEOUT after {elapsed:.2f}s")
-        logger.error(f"[OPENROUTER] Timeout after {elapsed:.2f}s")
-        raise ValueError(
-            "OpenRouter API timed out after 2 minutes. "
-            "Check your API key and internet connection."
-        )
         
     except Exception as e:
         elapsed = time.time() - start_time
@@ -521,7 +507,7 @@ def normalize_merged(merged: dict) -> dict:
   return merged
 
 
-async def parse_resume_text(resume_text: str) -> ParsedResume:
+def parse_resume_text(resume_text: str) -> ParsedResume:
     """
     Full two-pass OpenRouter extraction pipeline.
     
@@ -566,7 +552,7 @@ Every field must be present. Missing values must be null.
 ===== REQUIRED JSON SCHEMA =====
 {JSON_SCHEMA_TEMPLATE}"""
 
-    pass1_result = await call_llm(SYSTEM_PROMPT_PASS1, user_message_pass1)
+    pass1_result = call_llm(SYSTEM_PROMPT_PASS1, user_message_pass1)
     pass1_elapsed = time.time() - pass1_start
     
     print(f"[OPENROUTER PASS 1] ✓ Complete in {pass1_elapsed:.2f}s")
@@ -594,7 +580,7 @@ Find anything that was missed or incorrect.
 Return the corrected complete JSON."""
 
     try:
-        pass2_result = await call_llm(SYSTEM_PROMPT_PASS2, user_message_pass2)
+        pass2_result = call_llm(SYSTEM_PROMPT_PASS2, user_message_pass2)
         pass2_elapsed = time.time() - pass2_start
         print(f"[OPENROUTER PASS 2] ✓ Complete in {pass2_elapsed:.2f}s")
     except Exception as e:
@@ -662,7 +648,7 @@ Return the corrected complete JSON."""
         raise
 
 
-async def test_openrouter_connection() -> bool:
+def test_openrouter_connection() -> bool:
     """
     Quick test to verify OpenRouter API key and connection work.
     Call this from /health endpoint to verify setup.
@@ -670,10 +656,7 @@ async def test_openrouter_connection() -> bool:
     """
     try:
         print("[OPENROUTER TEST] Testing connection...")
-        result = await asyncio.wait_for(
-            _call_openrouter_api("Reply with: ok"),
-            timeout=30.0
-        )
+        result = _call_openrouter_api("Reply with: ok")
         print(f"[OPENROUTER TEST] ✓ Connection works: {result[:50]}")
         return True
     except Exception as e:

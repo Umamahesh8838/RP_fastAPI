@@ -8,7 +8,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-async def extract_text_from_pdf(file_bytes: bytes) -> dict:
+def extract_text_from_pdf(file_bytes: bytes) -> dict:
     """
     Extracts text from a PDF file.
     
@@ -64,7 +64,7 @@ async def extract_text_from_pdf(file_bytes: bytes) -> dict:
             os.remove(tmp_path)
 
 
-async def extract_text_from_docx(file_bytes: bytes) -> dict:
+def extract_text_from_docx(file_bytes: bytes) -> dict:
     """
     Extracts raw text from a .docx Word document file.
     

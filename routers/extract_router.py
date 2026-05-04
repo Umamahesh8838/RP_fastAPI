@@ -1,5 +1,5 @@
 from fastapi import APIRouter, UploadFile, File
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
 from database import get_db
 from fastapi import Depends
 from schemas.common_schema import SuccessResponse, ErrorResponse
@@ -48,7 +48,7 @@ async def extract_pdf_to_text(file: UploadFile = File(...)):
             )
         
         # Extract
-        result = await extract_service.extract_text_from_pdf(file_bytes)
+        result = extract_service.extract_text_from_pdf(file_bytes)
         return success_response(result)
         
     except ValueError as e:
@@ -92,7 +92,7 @@ async def extract_docx_to_text(file: UploadFile = File(...)):
             )
         
         # Extract
-        result = await extract_service.extract_text_from_docx(file_bytes)
+        result = extract_service.extract_text_from_docx(file_bytes)
         return success_response(result)
         
     except ValueError as e:

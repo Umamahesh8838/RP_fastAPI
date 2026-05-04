@@ -11,13 +11,12 @@ class Settings(BaseSettings):
     openrouter_api_key: str = os.getenv("OPENROUTER_API_KEY", "")
     openrouter_model: str = os.getenv("OPENROUTER_MODEL", "openai/gpt-3.5-turbo")
 
-    # Database - Priority: Environment Variables > .env file > defaults
-    db_driver: str = os.getenv("DB_DRIVER", "mssql")  # mysql | mssql
-    db_host: str = os.getenv("DB_HOST", "artisetsql.database.windows.net")
-    db_port: int = int(os.getenv("DB_PORT", "1433"))
-    db_user: str = os.getenv("DB_USER", "artiset")
+    # Database - MySQL 8.x on Azure
+    db_host: str = os.getenv("DB_HOST", "campus-test-server.mysql.database.azure.com")
+    db_port: int = int(os.getenv("DB_PORT", "3306"))
+    db_user: str = os.getenv("DB_USER", "artisetadmin")
     db_password: str = os.getenv("DB_PASSWORD", "")
-    db_name: str = os.getenv("DB_NAME", "campus5")
+    db_name: str = os.getenv("DB_NAME", "campus6")
 
     # App
     app_env: str = os.getenv("APP_ENV", "development")
@@ -27,31 +26,15 @@ class Settings(BaseSettings):
 
     @property
     def database_url(self) -> str:
-        """Builds async SQLAlchemy connection string for configured database engine."""
-        driver = self.db_driver.lower().strip()
-
-        if driver == "mssql":
-            # Azure SQL async connection string with aioodbc driver
-            # aioodbc provides async wrapper around pyodbc for SQL Server
-            user = quote_plus(self.db_user)
-            password = quote_plus(self.db_password)
-            connection_string = (
-                f"mssql+aioodbc://{user}:{password}@{self.db_host}:{self.db_port}/{self.db_name}"
-                "?driver=ODBC+Driver+18+for+SQL+Server"
-                "&Encrypt=yes"
-                "&TrustServerCertificate=no"
-                "&Connection+Timeout=120"
-            )
-            return connection_string
-
-        mysql_user = quote_plus(self.db_user)
-        mysql_password = quote_plus(self.db_password)
-        return f"mysql+aiomysql://{mysql_user}:{mysql_password}@{self.db_host}:{self.db_port}/{self.db_name}"
+        """Builds SQLAlchemy connection string for MySQL 8.x."""
+        user = quote_plus(self.db_user)
+        password = quote_plus(self.db_password)
+        return f"mysql+pymysql://{user}:{password}@{self.db_host}:{self.db_port}/{self.db_name}?charset=utf8mb4"
     
     def get_db_config_summary(self) -> dict:
         """Returns database configuration summary (without password)."""
         return {
-            "driver": self.db_driver,
+            "driver": "MySQL 8.x",
             "host": self.db_host,
             "port": self.db_port,
             "user": self.db_user,

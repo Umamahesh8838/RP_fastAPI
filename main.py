@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from sqlalchemy import text
-from database import engine, AsyncSessionLocal, Base
+from database import engine, SessionLocal, Base
 import time
 import os
 from datetime import datetime
@@ -45,18 +45,17 @@ async def lifespan(app: FastAPI):
     try:
         # Test database connection at startup
         logger.info("Testing database connection...")
-        async with AsyncSessionLocal() as db:
-            await db.execute(text("SELECT 1"))
+        with SessionLocal() as db:
+            db.execute(text("SELECT 1"))
         logger.info("✓ Database connection verified!")
         
     except Exception as e:
         logger.error(f"✗ Database connection failed at startup: {e}", exc_info=True)
         logger.error("⚠️  Application will continue but database operations will fail")
         logger.error("Common causes:")
-        logger.error("  1. Missing ODBC Driver 18 for SQL Server")
-        logger.error("  2. Incorrect database credentials")
-        logger.error("  3. Firewall blocking connection")
-        logger.error("  4. Azure SQL Server not accessible")
+        logger.error("  1. Incorrect MySQL credentials")
+        logger.error("  2. Firewall blocking connection")
+        logger.error("  3. Azure MySQL Server not accessible")
     
     logger.info("✓ Application started successfully!")
     logger.info(f"  Environment: {settings.app_env}")
@@ -67,7 +66,7 @@ async def lifespan(app: FastAPI):
     
     # Shutdown
     logger.info("Shutting down application...")
-    await engine.dispose()
+    engine.dispose()
     logger.info("✓ Shutdown complete.")
 
 
@@ -148,8 +147,8 @@ async def health_check():
     # ── 1. DATABASE CHECK ────────────────────────────
     db_start = time.time()
     try:
-        async with AsyncSessionLocal() as db:
-            await db.execute(text("SELECT 1"))
+        with SessionLocal() as db:
+            db.execute(text("SELECT 1"))
         db_elapsed = round(time.time() - db_start, 3)
         results["database"] = {
             "status": "connected",
@@ -226,13 +225,13 @@ async def health_check():
     
     # ── 5. STUDENT COUNT FROM DB ─────────────────────
     try:
-        async with AsyncSessionLocal() as db:
-            result = await db.execute(
+        with SessionLocal() as db:
+            result = db.execute(
                 text("SELECT COUNT(*) FROM tbl_cp_student")
             )
             student_count = result.scalar()
             
-            result2 = await db.execute(
+            result2 = db.execute(
                 text("SELECT COUNT(*) FROM tbl_cp_resume_hashes")
             )
             resume_count = result2.scalar()
@@ -299,8 +298,8 @@ async def init_database():
     """
     try:
         logger.info("Initializing database schema...")
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
+        with engine.begin() as conn:
+            Base.metadata.create_all(conn)
         logger.info("✓ Database schema initialized successfully!")
         return {
             "status": "success",
@@ -314,4 +313,16 @@ async def init_database():
             "message": str(e),
             "timestamp": datetime.now().isoformat()
         }
+
+
+if __name__ == "__main__":
+    import uvicorn
+    logger.info("Starting FastAPI server with uvicorn...")
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=False,
+        log_level="info"
+    )
 

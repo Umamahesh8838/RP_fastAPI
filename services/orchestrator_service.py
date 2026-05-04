@@ -8,12 +8,11 @@ Includes timing instrumentation for the main public entrypoints:
 
 import logging
 import time
-import asyncio
 from datetime import datetime
 from typing import Dict, Any
 
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
 from sqlalchemy.exc import OperationalError, ProgrammingError
 from config import get_settings
 
@@ -34,32 +33,18 @@ settings = get_settings()
 def _is_missing_resume_hash_table_error(err: Exception) -> bool:
 	err_text = str(err).lower()
 	return (
-		"42s02" in err_text
+		"1146" in err_text
+		or "doesn't exist" in err_text
+		or "42s02" in err_text
 		or "invalid object name 'tbl_cp_resume_hashes'" in err_text
 		or "no such table" in err_text
 	)
 
 
-async def _ensure_resume_hash_table(db: AsyncSession) -> None:
+def _ensure_resume_hash_table(db: Session) -> None:
 	"""Ensure tbl_cp_resume_hashes exists across supported database engines."""
-	driver = (settings.db_driver or "mysql").lower().strip()
-	if driver == "mssql":
-		await db.execute(
-			text(
-				"""
-				IF OBJECT_ID('dbo.tbl_cp_resume_hashes', 'U') IS NULL
-				BEGIN
-					CREATE TABLE dbo.tbl_cp_resume_hashes (
-						hash VARCHAR(64) NOT NULL PRIMARY KEY,
-						student_id INT NOT NULL,
-						created_at DATETIME2 DEFAULT SYSUTCDATETIME()
-					)
-				END
-				"""
-			)
-		)
-	else:
-		await db.execute(
+	try:
+		db.execute(
 			text(
 				"""
 				CREATE TABLE IF NOT EXISTS tbl_cp_resume_hashes (
@@ -70,15 +55,17 @@ async def _ensure_resume_hash_table(db: AsyncSession) -> None:
 				"""
 			)
 		)
-	await db.commit()
+		db.commit()
+	except Exception as e:
+		logger.warning(f"Could not create tbl_cp_resume_hashes: {e}")
 
 
-async def _execute_with_db_retry(db: AsyncSession, sql_text, params: dict, retries: int = 3):
+def _execute_with_db_retry(db: Session, sql_text, params: dict, retries: int = 3):
 	"""Retry transient DB connection timeouts (common with Azure SQL serverless cold starts)."""
 	last_err = None
 	for attempt in range(1, retries + 1):
 		try:
-			return await db.execute(sql_text, params)
+			return db.execute(sql_text, params)
 		except OperationalError as e:
 			last_err = e
 			err_text = str(e).lower()
@@ -88,26 +75,27 @@ async def _execute_with_db_retry(db: AsyncSession, sql_text, params: dict, retri
 				break
 			wait_s = attempt * 5
 			logger.warning(f"Transient DB timeout detected. Retrying in {wait_s}s (attempt {attempt}/{retries})")
-			await asyncio.sleep(wait_s)
+			time.sleep(wait_s)
 
 	raise last_err
 
 
-async def _find_existing_resume_hash(db: AsyncSession, resume_hash: str):
+def _find_existing_resume_hash(db: Session, resume_hash: str):
 	"""Return existing hash row and auto-heal missing table if needed."""
 	try:
-		result = await _execute_with_db_retry(
+		result = _execute_with_db_retry(
 			db,
 			text("SELECT student_id FROM tbl_cp_resume_hashes WHERE hash = :hash"),
 			{"hash": resume_hash},
 		)
 		return result.fetchone()
-	except ProgrammingError as e:
+	except Exception as e:
 		if not _is_missing_resume_hash_table_error(e):
 			raise
+		db.rollback()
 		logger.warning("tbl_cp_resume_hashes missing. Creating table and retrying hash lookup.")
-		await _ensure_resume_hash_table(db)
-		result = await _execute_with_db_retry(
+		_ensure_resume_hash_table(db)
+		result = _execute_with_db_retry(
 			db,
 			text("SELECT student_id FROM tbl_cp_resume_hashes WHERE hash = :hash"),
 			{"hash": resume_hash},
@@ -115,30 +103,31 @@ async def _find_existing_resume_hash(db: AsyncSession, resume_hash: str):
 		return result.fetchone()
 
 
-async def _save_resume_hash(db: AsyncSession, resume_hash: str, student_id: int) -> None:
+def _save_resume_hash(db: Session, resume_hash: str, student_id: int) -> None:
 	"""Insert resume hash and auto-heal missing table if needed."""
 	try:
-		await db.execute(
+		db.execute(
 			text("INSERT INTO tbl_cp_resume_hashes (hash, student_id) VALUES (:hash, :student_id)"),
 			{"hash": resume_hash, "student_id": student_id},
 		)
-		await db.commit()
-	except ProgrammingError as e:
+		db.commit()
+	except Exception as e:
 		if not _is_missing_resume_hash_table_error(e):
 			raise
+		db.rollback()
 		logger.warning("tbl_cp_resume_hashes missing during insert. Creating table and retrying.")
-		await _ensure_resume_hash_table(db)
-		await db.execute(
+		_ensure_resume_hash_table(db)
+		db.execute(
 			text("INSERT INTO tbl_cp_resume_hashes (hash, student_id) VALUES (:hash, :student_id)"),
 			{"hash": resume_hash, "student_id": student_id},
 		)
-		await db.commit()
+		db.commit()
 
 
 # ---------------------------------------------------------------------------
 # Full pipeline
 # ---------------------------------------------------------------------------
-async def run_full_pipeline(db: AsyncSession, file_bytes: bytes, filename: str) -> Dict[str, Any]:
+def run_full_pipeline(db: Session, file_bytes: bytes, filename: str) -> Dict[str, Any]:
 	"""Run the full resume pipeline (steps 1-15) with timing breakdown."""
 
 	warnings = []
@@ -163,9 +152,9 @@ async def run_full_pipeline(db: AsyncSession, file_bytes: bytes, filename: str) 
 	try:
 		file_ext = filename.lower().split(".")[-1] if "." in filename else ""
 		if file_ext == "pdf":
-			extract_result = await extract_service.extract_text_from_pdf(file_bytes)
+			extract_result = extract_service.extract_text_from_pdf(file_bytes)
 		elif file_ext == "docx":
-			extract_result = await extract_service.extract_text_from_docx(file_bytes)
+			extract_result = extract_service.extract_text_from_docx(file_bytes)
 		else:
 			raise ValueError("Unsupported file type. Please upload a PDF or DOCX file.")
 
@@ -183,7 +172,7 @@ async def run_full_pipeline(db: AsyncSession, file_bytes: bytes, filename: str) 
 	step_start = time.time()
 	try:
 		resume_hash = compute_resume_hash(resume_text)
-		existing_hash = await _find_existing_resume_hash(db, resume_hash)
+		existing_hash = _find_existing_resume_hash(db, resume_hash)
 		t_hash = time.time() - step_start
 		print(f"[TIMING] Hash check: {t_hash:.2f} seconds")
 
@@ -208,7 +197,7 @@ async def run_full_pipeline(db: AsyncSession, file_bytes: bytes, filename: str) 
 	print("[STEP 3] Calling LLM (two-pass)")
 	llm_start = time.perf_counter()
 	try:
-		parsed: ParsedResume = await llm_service.parse_resume_text(resume_text)
+		parsed: ParsedResume = llm_service.parse_resume_text(resume_text)
 	except Exception as e:
 		logger.error(f"Step 3 failed: {e}")
 		raise ValueError(f"LLM parsing failed: {e}")
@@ -221,7 +210,7 @@ async def run_full_pipeline(db: AsyncSession, file_bytes: bytes, filename: str) 
 	try:
 		salutation_id = None
 		if parsed.salutation:
-			sal_result = await lookup_service.find_salutation(db, parsed.salutation)
+			sal_result = lookup_service.find_salutation(db, parsed.salutation)
 			if getattr(sal_result, "found", False):
 				salutation_id = sal_result.salutation_id
 
@@ -241,7 +230,7 @@ async def run_full_pipeline(db: AsyncSession, file_bytes: bytes, filename: str) 
 			current_city=parsed.current_city,
 			gender=parsed.gender,
 		)
-		student_result = await save_service.save_student(db, student_request)
+		student_result = save_service.save_student(db, student_request)
 		student_id = student_result.student_id
 		already_existed = student_result.already_exists
 		logger.info(f"Student saved: id={student_id}, already_existed={already_existed}")
@@ -256,7 +245,7 @@ async def run_full_pipeline(db: AsyncSession, file_bytes: bytes, filename: str) 
 			if not school_item.standard:
 				continue
 			try:
-				await save_service.save_school(
+				save_service.save_school(
 					db,
 					SaveSchoolRequest(
 						student_id=student_id,
@@ -281,13 +270,13 @@ async def run_full_pipeline(db: AsyncSession, file_bytes: bytes, filename: str) 
 			if not edu_item.college_name or not edu_item.course_name:
 				continue
 			try:
-				college_result = await lookup_service.find_or_create_college(db, edu_item.college_name)
-				course_result = await lookup_service.find_or_create_course(
+				college_result = lookup_service.find_or_create_college(db, edu_item.college_name)
+				course_result = lookup_service.find_or_create_course(
 					db,
 					edu_item.course_name,
 					edu_item.specialization_name or "General",
 				)
-				await save_service.save_education(
+				save_service.save_education(
 					db,
 					SaveEducationRequest(
 						student_id=student_id,
@@ -314,7 +303,7 @@ async def run_full_pipeline(db: AsyncSession, file_bytes: bytes, filename: str) 
 			if not exp_item.company_name:
 				continue
 			try:
-				result = await save_service.save_workexp(
+				result = save_service.save_workexp(
 					db,
 					SaveWorkExpRequest(
 						student_id=student_id,
@@ -346,7 +335,7 @@ async def run_full_pipeline(db: AsyncSession, file_bytes: bytes, filename: str) 
 				if proj_item.workexp_company_name:
 					linked_workexp_id = workexp_map.get(proj_item.workexp_company_name)
 
-				proj_result = await save_service.save_project(
+				proj_result = save_service.save_project(
 					db,
 					SaveProjectRequest(
 						student_id=student_id,
@@ -364,8 +353,8 @@ async def run_full_pipeline(db: AsyncSession, file_bytes: bytes, filename: str) 
 					if not skill_name:
 						continue
 					try:
-						skill_result = await lookup_service.find_or_create_skill(db, skill_name, "Intermediate")
-						await save_service.save_project_skill(db, proj_result.project_id, skill_result.skill_id)
+						skill_result = lookup_service.find_or_create_skill(db, skill_name, "Intermediate")
+						save_service.save_project_skill(db, proj_result.project_id, skill_result.skill_id)
 					except Exception as e:
 						logger.warning(f"Failed to save project skill: {e}")
 						warnings.append(f"Project skill save failed: {e}")
@@ -382,10 +371,10 @@ async def run_full_pipeline(db: AsyncSession, file_bytes: bytes, filename: str) 
 			if not skill_item.name:
 				continue
 			try:
-				skill_result = await lookup_service.find_or_create_skill(
+				skill_result = lookup_service.find_or_create_skill(
 					db, skill_item.name, skill_item.complexity or "Intermediate"
 				)
-				await save_service.save_student_skill(db, student_id, skill_result.skill_id)
+				save_service.save_student_skill(db, student_id, skill_result.skill_id)
 				summary["skills_saved"] += 1
 			except Exception as e:
 				logger.warning(f"Failed to save student skill: {e}")
@@ -400,8 +389,8 @@ async def run_full_pipeline(db: AsyncSession, file_bytes: bytes, filename: str) 
 			if not lang_item.language_name:
 				continue
 			try:
-				lang_result = await lookup_service.find_or_create_language(db, lang_item.language_name)
-				await save_service.save_student_language(db, student_id, lang_result.language_id)
+				lang_result = lookup_service.find_or_create_language(db, lang_item.language_name)
+				save_service.save_student_language(db, student_id, lang_result.language_id)
 				summary["languages_saved"] += 1
 			except Exception as e:
 				logger.warning(f"Failed to save student language: {e}")
@@ -416,14 +405,14 @@ async def run_full_pipeline(db: AsyncSession, file_bytes: bytes, filename: str) 
 			if not cert_item.certification_name or not cert_item.issuing_organization:
 				continue
 			try:
-				cert_result = await lookup_service.find_or_create_certification(
+				cert_result = lookup_service.find_or_create_certification(
 					db,
 					cert_item.certification_name,
 					cert_item.issuing_organization,
 					cert_item.certification_type or "General",
 					cert_item.is_lifetime,
 				)
-				await save_service.save_student_certification(
+				save_service.save_student_certification(
 					db,
 					{
 						"student_id": student_id,
@@ -448,8 +437,8 @@ async def run_full_pipeline(db: AsyncSession, file_bytes: bytes, filename: str) 
 			if not interest_item.name:
 				continue
 			try:
-				interest_result = await lookup_service.find_or_create_interest(db, interest_item.name)
-				await save_service.save_student_interest(db, student_id, interest_result.interest_id)
+				interest_result = lookup_service.find_or_create_interest(db, interest_item.name)
+				save_service.save_student_interest(db, student_id, interest_result.interest_id)
 				summary["interests_saved"] += 1
 			except Exception as e:
 				logger.warning(f"Failed to save interest: {e}")
@@ -464,12 +453,12 @@ async def run_full_pipeline(db: AsyncSession, file_bytes: bytes, filename: str) 
 			if not addr_item.address_line_1 or not addr_item.pincode:
 				continue
 			try:
-				pincode_result = await lookup_service.find_pincode(db, addr_item.pincode)
+				pincode_result = lookup_service.find_pincode(db, addr_item.pincode)
 				if not getattr(pincode_result, "found", False):
 					warnings.append(f"Pincode {addr_item.pincode} not found. Address skipped.")
 					continue
 
-				await save_service.save_address(
+				save_service.save_address(
 					db,
 					SaveAddressRequest(
 						student_id=student_id,
@@ -490,7 +479,7 @@ async def run_full_pipeline(db: AsyncSession, file_bytes: bytes, filename: str) 
 	# STEP 14 — Store resume hash
 	logger.info("STEP 14 — Store resume hash")
 	try:
-		await _save_resume_hash(db, resume_hash, student_id)
+		_save_resume_hash(db, resume_hash, student_id)
 	except Exception as e:
 		logger.warning(f"Resume hash storage failed: {e}")
 		warnings.append(f"Resume hash storage failed: {e}")
@@ -517,7 +506,7 @@ async def run_full_pipeline(db: AsyncSession, file_bytes: bytes, filename: str) 
 # ---------------------------------------------------------------------------
 # Preview pipeline (no DB writes)
 # ---------------------------------------------------------------------------
-async def parse_resume_preview(db: AsyncSession, file_bytes: bytes, filename: str) -> Dict[str, Any]:
+def parse_resume_preview(db: Session, file_bytes: bytes, filename: str) -> Dict[str, Any]:
 	"""Parse resume for preview with caching and timing; no DB writes."""
 
 	overall_start = time.perf_counter()
@@ -535,9 +524,9 @@ async def parse_resume_preview(db: AsyncSession, file_bytes: bytes, filename: st
 	try:
 		file_ext = filename.lower().split(".")[-1] if "." in filename else ""
 		if file_ext == "pdf":
-			extract_result = await extract_service.extract_text_from_pdf(file_bytes)
+			extract_result = extract_service.extract_text_from_pdf(file_bytes)
 		elif file_ext == "docx":
-			extract_result = await extract_service.extract_text_from_docx(file_bytes)
+			extract_result = extract_service.extract_text_from_docx(file_bytes)
 		else:
 			raise ValueError("Unsupported file type. Please upload a PDF or DOCX file.")
 
@@ -555,7 +544,7 @@ async def parse_resume_preview(db: AsyncSession, file_bytes: bytes, filename: st
 	step_start = time.time()
 	try:
 		resume_hash = compute_resume_hash(resume_text)
-		existing_hash = await _find_existing_resume_hash(db, resume_hash)
+		existing_hash = _find_existing_resume_hash(db, resume_hash)
 		already_exists = existing_hash is not None
 		t_hash = time.time() - step_start
 		print(f"[TIMING] Hash check: {t_hash:.2f} seconds")
@@ -578,7 +567,7 @@ async def parse_resume_preview(db: AsyncSession, file_bytes: bytes, filename: st
 	print("[STEP 3] Calling LLM (two-pass)")
 	llm_start = time.perf_counter()
 	try:
-		parsed: ParsedResume = await llm_service.parse_resume_text(resume_text)
+		parsed: ParsedResume = llm_service.parse_resume_text(resume_text)
 	except Exception as e:
 		logger.error(f"Preview LLM parse failed: {e}")
 		raise ValueError(f"LLM parsing failed: {e}")
@@ -631,7 +620,7 @@ async def parse_resume_preview(db: AsyncSession, file_bytes: bytes, filename: st
 # ---------------------------------------------------------------------------
 # Save confirmed (no extraction/LLM, steps 4-15)
 # ---------------------------------------------------------------------------
-async def save_confirmed_resume(db: AsyncSession, resume_hash: str, parsed: ParsedResume) -> Dict[str, Any]:
+def save_confirmed_resume(db: Session, resume_hash: str, parsed: ParsedResume) -> Dict[str, Any]:
 	"""Save a confirmed ParsedResume to the database (steps 4-15)."""
 
 	warnings = []
@@ -652,7 +641,7 @@ async def save_confirmed_resume(db: AsyncSession, resume_hash: str, parsed: Pars
 		parsed = ParsedResume(**parsed)
 
 	try:
-		existing = await _find_existing_resume_hash(db, resume_hash)
+		existing = _find_existing_resume_hash(db, resume_hash)
 		already_existed = existing is not None
 	except Exception as e:
 		logger.warning(f"Hash pre-check failed: {e}")
@@ -662,7 +651,7 @@ async def save_confirmed_resume(db: AsyncSession, resume_hash: str, parsed: Pars
 	try:
 		salutation_id = None
 		if parsed.salutation:
-			sal_result = await lookup_service.find_salutation(db, parsed.salutation)
+			sal_result = lookup_service.find_salutation(db, parsed.salutation)
 			if getattr(sal_result, "found", False):
 				salutation_id = sal_result.salutation_id
 
@@ -682,7 +671,7 @@ async def save_confirmed_resume(db: AsyncSession, resume_hash: str, parsed: Pars
 			current_city=parsed.current_city,
 			gender=parsed.gender,
 		)
-		student_result = await save_service.save_student(db, student_request)
+		student_result = save_service.save_student(db, student_request)
 		student_id = student_result.student_id
 	except Exception as e:
 		logger.error(f"Save-confirmed student save failed: {e}")
@@ -694,7 +683,7 @@ async def save_confirmed_resume(db: AsyncSession, resume_hash: str, parsed: Pars
 			if not school_item.standard:
 				continue
 			try:
-				await save_service.save_school(
+				save_service.save_school(
 					db,
 					SaveSchoolRequest(
 						student_id=student_id,
@@ -718,13 +707,13 @@ async def save_confirmed_resume(db: AsyncSession, resume_hash: str, parsed: Pars
 			if not edu_item.college_name or not edu_item.course_name:
 				continue
 			try:
-				college_result = await lookup_service.find_or_create_college(db, edu_item.college_name)
-				course_result = await lookup_service.find_or_create_course(
+				college_result = lookup_service.find_or_create_college(db, edu_item.college_name)
+				course_result = lookup_service.find_or_create_course(
 					db,
 					edu_item.course_name,
 					edu_item.specialization_name or "General",
 				)
-				await save_service.save_education(
+				save_service.save_education(
 					db,
 					SaveEducationRequest(
 						student_id=student_id,
@@ -750,7 +739,7 @@ async def save_confirmed_resume(db: AsyncSession, resume_hash: str, parsed: Pars
 			if not exp_item.company_name:
 				continue
 			try:
-				result = await save_service.save_workexp(
+				result = save_service.save_workexp(
 					db,
 					SaveWorkExpRequest(
 						student_id=student_id,
@@ -781,7 +770,7 @@ async def save_confirmed_resume(db: AsyncSession, resume_hash: str, parsed: Pars
 				if proj_item.workexp_company_name:
 					linked_workexp_id = workexp_map.get(proj_item.workexp_company_name)
 
-				proj_result = await save_service.save_project(
+				proj_result = save_service.save_project(
 					db,
 					SaveProjectRequest(
 						student_id=student_id,
@@ -799,8 +788,8 @@ async def save_confirmed_resume(db: AsyncSession, resume_hash: str, parsed: Pars
 					if not skill_name:
 						continue
 					try:
-						skill_result = await lookup_service.find_or_create_skill(db, skill_name, "Intermediate")
-						await save_service.save_project_skill(db, proj_result.project_id, skill_result.skill_id)
+						skill_result = lookup_service.find_or_create_skill(db, skill_name, "Intermediate")
+						save_service.save_project_skill(db, proj_result.project_id, skill_result.skill_id)
 					except Exception as e:
 						logger.warning(f"Failed to save project skill: {e}")
 						warnings.append(f"Project skill save failed: {e}")
@@ -816,10 +805,10 @@ async def save_confirmed_resume(db: AsyncSession, resume_hash: str, parsed: Pars
 			if not skill_item.name:
 				continue
 			try:
-				skill_result = await lookup_service.find_or_create_skill(
+				skill_result = lookup_service.find_or_create_skill(
 					db, skill_item.name, skill_item.complexity or "Intermediate"
 				)
-				await save_service.save_student_skill(db, student_id, skill_result.skill_id)
+				save_service.save_student_skill(db, student_id, skill_result.skill_id)
 				summary["skills_saved"] += 1
 			except Exception as e:
 				logger.warning(f"Failed to save student skill: {e}")
@@ -833,8 +822,8 @@ async def save_confirmed_resume(db: AsyncSession, resume_hash: str, parsed: Pars
 			if not lang_item.language_name:
 				continue
 			try:
-				lang_result = await lookup_service.find_or_create_language(db, lang_item.language_name)
-				await save_service.save_student_language(db, student_id, lang_result.language_id)
+				lang_result = lookup_service.find_or_create_language(db, lang_item.language_name)
+				save_service.save_student_language(db, student_id, lang_result.language_id)
 				summary["languages_saved"] += 1
 			except Exception as e:
 				logger.warning(f"Failed to save language: {e}")
@@ -848,14 +837,14 @@ async def save_confirmed_resume(db: AsyncSession, resume_hash: str, parsed: Pars
 			if not cert_item.certification_name or not cert_item.issuing_organization:
 				continue
 			try:
-				cert_result = await lookup_service.find_or_create_certification(
+				cert_result = lookup_service.find_or_create_certification(
 					db,
 					cert_item.certification_name,
 					cert_item.issuing_organization,
 					cert_item.certification_type or "General",
 					cert_item.is_lifetime,
 				)
-				await save_service.save_student_certification(
+				save_service.save_student_certification(
 					db,
 					{
 						"student_id": student_id,
@@ -879,8 +868,8 @@ async def save_confirmed_resume(db: AsyncSession, resume_hash: str, parsed: Pars
 			if not interest_item.name:
 				continue
 			try:
-				interest_result = await lookup_service.find_or_create_interest(db, interest_item.name)
-				await save_service.save_student_interest(db, student_id, interest_result.interest_id)
+				interest_result = lookup_service.find_or_create_interest(db, interest_item.name)
+				save_service.save_student_interest(db, student_id, interest_result.interest_id)
 				summary["interests_saved"] += 1
 			except Exception as e:
 				logger.warning(f"Failed to save interest: {e}")
@@ -894,12 +883,12 @@ async def save_confirmed_resume(db: AsyncSession, resume_hash: str, parsed: Pars
 			if not addr_item.address_line_1 or not addr_item.pincode:
 				continue
 			try:
-				pincode_result = await lookup_service.find_pincode(db, addr_item.pincode)
+				pincode_result = lookup_service.find_pincode(db, addr_item.pincode)
 				if not getattr(pincode_result, "found", False):
 					warnings.append(f"Pincode {addr_item.pincode} not found. Address skipped.")
 					continue
 
-				await save_service.save_address(
+				save_service.save_address(
 					db,
 					SaveAddressRequest(
 						student_id=student_id,
@@ -919,7 +908,7 @@ async def save_confirmed_resume(db: AsyncSession, resume_hash: str, parsed: Pars
 
 	# STEP 14 — Store resume hash
 	try:
-		await _save_resume_hash(db, resume_hash, student_id)
+		_save_resume_hash(db, resume_hash, student_id)
 	except Exception as e:
 		logger.warning(f"Resume hash storage failed: {e}")
 		warnings.append(f"Resume hash storage failed: {e}")
@@ -936,7 +925,7 @@ async def save_confirmed_resume(db: AsyncSession, resume_hash: str, parsed: Pars
 # ---------------------------------------------------------------------------
 # Bulk processing
 # ---------------------------------------------------------------------------
-async def process_bulk_resumes(
+def process_bulk_resumes(
     batch_id: str,
     files_data: list
 ):
@@ -980,9 +969,9 @@ async def process_bulk_resumes(
         try:
             # Step 1: Extract text
             if extension == ".pdf":
-                extract_result = await extract_text_from_pdf(file_bytes)
+                extract_result = extract_text_from_pdf(file_bytes)
             elif extension == ".docx":
-                extract_result = await extract_text_from_docx(file_bytes)
+                extract_result = extract_text_from_docx(file_bytes)
             else:
                 raise ValueError(f"Unsupported file type: {extension}")
             
@@ -1001,7 +990,7 @@ async def process_bulk_resumes(
                 # Step 3: Parse with LLM
                 logger.info(f"[BULK] Parsing {filename} with LLM...")
                 print(f"[BULK] Parsing {filename} with LLM...")
-                parsed_result = await parse_resume_text(resume_text)
+                parsed_result = parse_resume_text(resume_text)
                 parsed_dict = parsed_result.model_dump()
                 already_exists = False
             
@@ -1047,7 +1036,7 @@ async def process_bulk_resumes(
         if i < len(files_data) - 1:
             logger.info(f"[BULK] Waiting 3s before next file...")
             print(f"[BULK] Waiting 3s before next file...")
-            await asyncio.sleep(3)
+            time.sleep(3)
     
     logger.info(f"[BULK] Batch {batch_id[:8]}... finished processing all files")
     print(f"[BULK] Batch {batch_id[:8]}... finished processing all files")

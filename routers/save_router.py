@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
 from database import get_db
 from pydantic import BaseModel
 from schemas.common_schema import SuccessResponse, ErrorResponse
@@ -41,10 +41,10 @@ class SaveStudentCertificationRequest(BaseModel):
 
 
 @router.post("/student", response_model=SuccessResponse)
-async def save_student_endpoint(request: SaveStudentRequest, db: AsyncSession = Depends(get_db)):
+def save_student_endpoint(request: SaveStudentRequest, db: Session = Depends(get_db)):
     """Saves a student record."""
     try:
-        result = await save_service.save_student(db, request)
+        result = save_service.save_student(db, request)
         return success_response(result.model_dump())
     except Exception as e:
         logger.error(f"Error in /save/student: {e}")
@@ -52,10 +52,10 @@ async def save_student_endpoint(request: SaveStudentRequest, db: AsyncSession = 
 
 
 @router.post("/school", response_model=SuccessResponse)
-async def save_school_endpoint(request: SaveSchoolRequest, db: AsyncSession = Depends(get_db)):
+def save_school_endpoint(request: SaveSchoolRequest, db: Session = Depends(get_db)):
     """Saves a school record."""
     try:
-        result = await save_service.save_school(db, request)
+        result = save_service.save_school(db, request)
         return success_response(result)
     except Exception as e:
         logger.error(f"Error in /save/school: {e}")
@@ -63,10 +63,10 @@ async def save_school_endpoint(request: SaveSchoolRequest, db: AsyncSession = De
 
 
 @router.post("/education", response_model=SuccessResponse)
-async def save_education_endpoint(request: SaveEducationRequest, db: AsyncSession = Depends(get_db)):
+def save_education_endpoint(request: SaveEducationRequest, db: Session = Depends(get_db)):
     """Saves an education record."""
     try:
-        result = await save_service.save_education(db, request)
+        result = save_service.save_education(db, request)
         return success_response(result)
     except Exception as e:
         logger.error(f"Error in /save/education: {e}")
@@ -74,10 +74,10 @@ async def save_education_endpoint(request: SaveEducationRequest, db: AsyncSessio
 
 
 @router.post("/workexp", response_model=SuccessResponse)
-async def save_workexp_endpoint(request: SaveWorkExpRequest, db: AsyncSession = Depends(get_db)):
+def save_workexp_endpoint(request: SaveWorkExpRequest, db: Session = Depends(get_db)):
     """Saves a work experience record."""
     try:
-        result = await save_service.save_workexp(db, request)
+        result = save_service.save_workexp(db, request)
         return success_response(result.model_dump())
     except Exception as e:
         logger.error(f"Error in /save/workexp: {e}")
@@ -85,10 +85,10 @@ async def save_workexp_endpoint(request: SaveWorkExpRequest, db: AsyncSession = 
 
 
 @router.post("/project", response_model=SuccessResponse)
-async def save_project_endpoint(request: SaveProjectRequest, db: AsyncSession = Depends(get_db)):
+def save_project_endpoint(request: SaveProjectRequest, db: Session = Depends(get_db)):
     """Saves a project record."""
     try:
-        result = await save_service.save_project(db, request)
+        result = save_service.save_project(db, request)
         return success_response(result.model_dump())
     except Exception as e:
         logger.error(f"Error in /save/project: {e}")
@@ -96,10 +96,10 @@ async def save_project_endpoint(request: SaveProjectRequest, db: AsyncSession = 
 
 
 @router.post("/project-skill", response_model=SuccessResponse)
-async def save_project_skill_endpoint(request: SaveProjectSkillRequest, db: AsyncSession = Depends(get_db)):
+def save_project_skill_endpoint(request: SaveProjectSkillRequest, db: Session = Depends(get_db)):
     """Saves a project-skill relationship."""
     try:
-        result = await save_service.save_project_skill(db, request.project_id, request.skill_id)
+        result = save_service.save_project_skill(db, request.project_id, request.skill_id)
         return success_response(result)
     except Exception as e:
         logger.error(f"Error in /save/project-skill: {e}")
@@ -107,10 +107,10 @@ async def save_project_skill_endpoint(request: SaveProjectSkillRequest, db: Asyn
 
 
 @router.post("/student-skill", response_model=SuccessResponse)
-async def save_student_skill_endpoint(request: SaveStudentSkillRequest, db: AsyncSession = Depends(get_db)):
+def save_student_skill_endpoint(request: SaveStudentSkillRequest, db: Session = Depends(get_db)):
     """Saves a student-skill relationship."""
     try:
-        result = await save_service.save_student_skill(db, request.student_id, request.skill_id)
+        result = save_service.save_student_skill(db, request.student_id, request.skill_id)
         return success_response(result)
     except Exception as e:
         logger.error(f"Error in /save/student-skill: {e}")
@@ -118,10 +118,10 @@ async def save_student_skill_endpoint(request: SaveStudentSkillRequest, db: Asyn
 
 
 @router.post("/student-language", response_model=SuccessResponse)
-async def save_student_language_endpoint(request: SaveStudentLanguageRequest, db: AsyncSession = Depends(get_db)):
+def save_student_language_endpoint(request: SaveStudentLanguageRequest, db: Session = Depends(get_db)):
     """Saves a student-language relationship."""
     try:
-        result = await save_service.save_student_language(db, request.student_id, request.language_id)
+        result = save_service.save_student_language(db, request.student_id, request.language_id)
         return success_response(result)
     except Exception as e:
         logger.error(f"Error in /save/student-language: {e}")
@@ -129,10 +129,10 @@ async def save_student_language_endpoint(request: SaveStudentLanguageRequest, db
 
 
 @router.post("/student-interest", response_model=SuccessResponse)
-async def save_student_interest_endpoint(request: SaveStudentInterestRequest, db: AsyncSession = Depends(get_db)):
+def save_student_interest_endpoint(request: SaveStudentInterestRequest, db: Session = Depends(get_db)):
     """Saves a student-interest relationship."""
     try:
-        result = await save_service.save_student_interest(db, request.student_id, request.interest_id)
+        result = save_service.save_student_interest(db, request.student_id, request.interest_id)
         return success_response(result)
     except Exception as e:
         logger.error(f"Error in /save/student-interest: {e}")
@@ -140,7 +140,7 @@ async def save_student_interest_endpoint(request: SaveStudentInterestRequest, db
 
 
 @router.post("/student-certification", response_model=SuccessResponse)
-async def save_student_certification_endpoint(request: SaveStudentCertificationRequest, db: AsyncSession = Depends(get_db)):
+def save_student_certification_endpoint(request: SaveStudentCertificationRequest, db: Session = Depends(get_db)):
     """Saves a student-certification relationship."""
     try:
         data = {
@@ -151,7 +151,7 @@ async def save_student_certification_endpoint(request: SaveStudentCertificationR
             "certificate_url": request.certificate_url,
             "credential_id": request.credential_id
         }
-        result = await save_service.save_student_certification(db, data)
+        result = save_service.save_student_certification(db, data)
         return success_response(result)
     except Exception as e:
         logger.error(f"Error in /save/student-certification: {e}")
@@ -159,10 +159,10 @@ async def save_student_certification_endpoint(request: SaveStudentCertificationR
 
 
 @router.post("/address", response_model=SuccessResponse)
-async def save_address_endpoint(request: SaveAddressRequest, db: AsyncSession = Depends(get_db)):
+def save_address_endpoint(request: SaveAddressRequest, db: Session = Depends(get_db)):
     """Saves an address record."""
     try:
-        result = await save_service.save_address(db, request)
+        result = save_service.save_address(db, request)
         return success_response(result.model_dump())
     except Exception as e:
         logger.error(f"Error in /save/address: {e}")

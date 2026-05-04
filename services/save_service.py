@@ -1,4 +1,4 @@
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
 from sqlalchemy import text
 import logging
 from datetime import date
@@ -12,7 +12,7 @@ from utils.date_utils import safe_date
 logger = logging.getLogger(__name__)
 
 
-async def save_student(db: AsyncSession, data: SaveStudentRequest) -> SaveStudentResponse:
+def save_student(db: Session, data: SaveStudentRequest) -> SaveStudentResponse:
     """
     Saves a student record to tbl_cp_student.
     Returns existing student_id if email already exists.
@@ -27,7 +27,7 @@ async def save_student(db: AsyncSession, data: SaveStudentRequest) -> SaveStuden
     logger.debug(f"Checking if student exists: {data.email}")
     
     # Check if student with same email exists
-    result = await db.execute(
+    result = db.execute(
         text("SELECT student_id FROM tbl_cp_student WHERE email = :email"),
         {"email": data.email}
     )
@@ -38,14 +38,14 @@ async def save_student(db: AsyncSession, data: SaveStudentRequest) -> SaveStuden
         return SaveStudentResponse(student_id=existing[0], already_exists=True)
     
     # Get next student_id
-    result = await db.execute(text("SELECT COALESCE(MAX(student_id), 0) + 1 FROM tbl_cp_student"))
+    result = db.execute(text("SELECT COALESCE(MAX(student_id), 0) + 1 FROM tbl_cp_student"))
     next_id = result.scalar()
     
     # Apply defaults
     date_of_birth = safe_date(data.date_of_birth, date(1900, 1, 1))
     
     # Insert new student
-    await db.execute(
+    db.execute(
         text("""INSERT INTO tbl_cp_student 
                 (student_id, salutation_id, first_name, middle_name, last_name, email, alt_email,
                  contact_number, alt_contact_number, linkedin_url, github_url, portfolio_url,
@@ -75,13 +75,13 @@ async def save_student(db: AsyncSession, data: SaveStudentRequest) -> SaveStuden
             "profile_photo_url": 'default_profile.png'
         }
     )
-    await db.commit()
+    db.commit()
     logger.debug(f"Student saved: {next_id}")
     
     return SaveStudentResponse(student_id=next_id, already_exists=False)
 
 
-async def save_school(db: AsyncSession, data: SaveSchoolRequest):
+def save_school(db: Session, data: SaveSchoolRequest):
     """
     Saves a school record to tbl_cp_student_school.
     
@@ -95,11 +95,11 @@ async def save_school(db: AsyncSession, data: SaveSchoolRequest):
     logger.debug(f"Saving school for student: {data.student_id}")
     
     # Get next school_id
-    result = await db.execute(text("SELECT COALESCE(MAX(school_id), 0) + 1 FROM tbl_cp_student_school"))
+    result = db.execute(text("SELECT COALESCE(MAX(school_id), 0) + 1 FROM tbl_cp_student_school"))
     next_id = result.scalar()
     
     # Insert new school
-    await db.execute(
+    db.execute(
         text("""INSERT INTO tbl_cp_student_school 
                 (school_id, student_id, standard, board, school_name, percentage, passing_year)
                 VALUES (:school_id, :student_id, :standard, :board, :school_name, :percentage, :passing_year)"""),
@@ -113,13 +113,13 @@ async def save_school(db: AsyncSession, data: SaveSchoolRequest):
             "passing_year": data.passing_year or 0
         }
     )
-    await db.commit()
+    db.commit()
     logger.debug(f"School saved: {next_id}")
     
     return {"school_id": next_id}
 
 
-async def save_education(db: AsyncSession, data: SaveEducationRequest):
+def save_education(db: Session, data: SaveEducationRequest):
     """
     Saves a college education record to tbl_cp_student_education.
     
@@ -133,11 +133,11 @@ async def save_education(db: AsyncSession, data: SaveEducationRequest):
     logger.debug(f"Saving education for student: {data.student_id}")
     
     # Get next edu_id
-    result = await db.execute(text("SELECT COALESCE(MAX(edu_id), 0) + 1 FROM tbl_cp_student_education"))
+    result = db.execute(text("SELECT COALESCE(MAX(edu_id), 0) + 1 FROM tbl_cp_student_education"))
     next_id = result.scalar()
     
     # Insert new education
-    await db.execute(
+    db.execute(
         text("""INSERT INTO tbl_cp_student_education 
                 (edu_id, student_id, college_id, course_id, start_year, end_year, cgpa, percentage)
                 VALUES (:edu_id, :student_id, :college_id, :course_id, :start_year, :end_year, :cgpa, :percentage)"""),
@@ -152,13 +152,13 @@ async def save_education(db: AsyncSession, data: SaveEducationRequest):
             "percentage": data.percentage or 0.00
         }
     )
-    await db.commit()
+    db.commit()
     logger.debug(f"Education saved: {next_id}")
     
     return {"edu_id": next_id}
 
 
-async def save_workexp(db: AsyncSession, data: SaveWorkExpRequest) -> SaveWorkExpResponse:
+def save_workexp(db: Session, data: SaveWorkExpRequest) -> SaveWorkExpResponse:
     """
     Saves a work experience record to tbl_cp_student_workexp.
     
@@ -172,7 +172,7 @@ async def save_workexp(db: AsyncSession, data: SaveWorkExpRequest) -> SaveWorkEx
     logger.debug(f"Saving work experience for student: {data.student_id}")
     
     # Get next workexp_id
-    result = await db.execute(text("SELECT COALESCE(MAX(workexp_id), 0) + 1 FROM tbl_cp_student_workexp"))
+    result = db.execute(text("SELECT COALESCE(MAX(workexp_id), 0) + 1 FROM tbl_cp_student_workexp"))
     next_id = result.scalar()
     
     # Handle dates
@@ -185,7 +185,7 @@ async def save_workexp(db: AsyncSession, data: SaveWorkExpRequest) -> SaveWorkEx
         end_date = safe_date(data.end_date, date(1900, 1, 1))
     
     # Insert new work experience
-    await db.execute(
+    db.execute(
         text("""INSERT INTO tbl_cp_student_workexp 
                 (workexp_id, student_id, company_name, company_location, designation, employment_type, start_date, end_date, is_current)
                 VALUES (:workexp_id, :student_id, :company_name, :company_location, :designation, :employment_type, :start_date, :end_date, :is_current)"""),
@@ -201,13 +201,13 @@ async def save_workexp(db: AsyncSession, data: SaveWorkExpRequest) -> SaveWorkEx
             "is_current": data.is_current
         }
     )
-    await db.commit()
+    db.commit()
     logger.debug(f"Work experience saved: {next_id}")
     
     return SaveWorkExpResponse(workexp_id=next_id)
 
 
-async def save_project(db: AsyncSession, data: SaveProjectRequest) -> SaveProjectResponse:
+def save_project(db: Session, data: SaveProjectRequest) -> SaveProjectResponse:
     """
     Saves a project record to tbl_cp_studentprojects.
     
@@ -221,7 +221,7 @@ async def save_project(db: AsyncSession, data: SaveProjectRequest) -> SaveProjec
     logger.debug(f"Saving project for student: {data.student_id}")
     
     # Get next project_id
-    result = await db.execute(text("SELECT COALESCE(MAX(project_id), 0) + 1 FROM tbl_cp_studentprojects"))
+    result = db.execute(text("SELECT COALESCE(MAX(project_id), 0) + 1 FROM tbl_cp_studentprojects"))
     next_id = result.scalar()
     
     # Handle dates
@@ -229,7 +229,7 @@ async def save_project(db: AsyncSession, data: SaveProjectRequest) -> SaveProjec
     end_date = safe_date(data.project_end_date, date(1900, 1, 1))
     
     # Insert new project
-    await db.execute(
+    db.execute(
         text("""INSERT INTO tbl_cp_studentprojects 
                 (project_id, student_id, workexp_id, project_title, project_description, achievements, project_start_date, project_end_date)
                 VALUES (:project_id, :student_id, :workexp_id, :project_title, :project_description, :achievements, :project_start_date, :project_end_date)"""),
@@ -244,13 +244,13 @@ async def save_project(db: AsyncSession, data: SaveProjectRequest) -> SaveProjec
             "project_end_date": end_date.strftime('%Y-%m-%d')
         }
     )
-    await db.commit()
+    db.commit()
     logger.debug(f"Project saved: {next_id}")
     
     return SaveProjectResponse(project_id=next_id)
 
 
-async def save_project_skill(db: AsyncSession, project_id: int, skill_id: int):
+def save_project_skill(db: Session, project_id: int, skill_id: int):
     """
     Saves a project-skill many-to-many relationship to tbl_cp_m2m_studentproject_skill.
     Does not error if relationship already exists.
@@ -266,7 +266,7 @@ async def save_project_skill(db: AsyncSession, project_id: int, skill_id: int):
     logger.debug(f"Saving project skill: project_id={project_id}, skill_id={skill_id}")
     
     # Check if already exists
-    result = await db.execute(
+    result = db.execute(
         text("SELECT row_id FROM tbl_cp_m2m_studentproject_skill WHERE project_id = :project_id AND skill_id = :skill_id"),
         {"project_id": project_id, "skill_id": skill_id}
     )
@@ -276,18 +276,18 @@ async def save_project_skill(db: AsyncSession, project_id: int, skill_id: int):
         return {"already_exists": True}
     
     # Insert new relationship
-    await db.execute(
+    db.execute(
         text("""INSERT INTO tbl_cp_m2m_studentproject_skill (project_id, skill_id)
                 VALUES (:project_id, :skill_id)"""),
         {"project_id": project_id, "skill_id": skill_id}
     )
-    await db.commit()
+    db.commit()
     logger.debug(f"Project skill saved")
     
     return {"already_exists": False}
 
 
-async def save_student_skill(db: AsyncSession, student_id: int, skill_id: int):
+def save_student_skill(db: Session, student_id: int, skill_id: int):
     """
     Saves a student-skill many-to-many relationship to tbl_cp_m2m_std_skill.
     Does not error if relationship already exists.
@@ -303,7 +303,7 @@ async def save_student_skill(db: AsyncSession, student_id: int, skill_id: int):
     logger.debug(f"Saving student skill: student_id={student_id}, skill_id={skill_id}")
     
     # Check if already exists
-    result = await db.execute(
+    result = db.execute(
         text("SELECT row_id FROM tbl_cp_m2m_std_skill WHERE student_id = :student_id AND skill_id = :skill_id"),
         {"student_id": student_id, "skill_id": skill_id}
     )
@@ -313,18 +313,18 @@ async def save_student_skill(db: AsyncSession, student_id: int, skill_id: int):
         return {"already_exists": True}
     
     # Insert new relationship
-    await db.execute(
+    db.execute(
         text("""INSERT INTO tbl_cp_m2m_std_skill (student_id, skill_id)
                 VALUES (:student_id, :skill_id)"""),
         {"student_id": student_id, "skill_id": skill_id}
     )
-    await db.commit()
+    db.commit()
     logger.debug(f"Student skill saved")
     
     return {"already_exists": False}
 
 
-async def save_student_language(db: AsyncSession, student_id: int, language_id: int):
+def save_student_language(db: Session, student_id: int, language_id: int):
     """
     Saves a student-language many-to-many relationship to tbl_cp_m2m_std_lng.
     
@@ -339,7 +339,7 @@ async def save_student_language(db: AsyncSession, student_id: int, language_id: 
     logger.debug(f"Saving student language: student_id={student_id}, language_id={language_id}")
     
     # Check if already exists
-    result = await db.execute(
+    result = db.execute(
         text("SELECT row_id FROM tbl_cp_m2m_std_lng WHERE student_id = :student_id AND language_id = :language_id"),
         {"student_id": student_id, "language_id": language_id}
     )
@@ -349,18 +349,18 @@ async def save_student_language(db: AsyncSession, student_id: int, language_id: 
         return {"already_exists": True}
     
     # Insert new relationship
-    await db.execute(
+    db.execute(
         text("""INSERT INTO tbl_cp_m2m_std_lng (student_id, language_id)
                 VALUES (:student_id, :language_id)"""),
         {"student_id": student_id, "language_id": language_id}
     )
-    await db.commit()
+    db.commit()
     logger.debug(f"Student language saved")
     
     return {"already_exists": False}
 
 
-async def save_student_interest(db: AsyncSession, student_id: int, interest_id: int):
+def save_student_interest(db: Session, student_id: int, interest_id: int):
     """
     Saves a student-interest many-to-many relationship to tbl_cp_m2m_std_interest.
     
@@ -375,7 +375,7 @@ async def save_student_interest(db: AsyncSession, student_id: int, interest_id: 
     logger.debug(f"Saving student interest: student_id={student_id}, interest_id={interest_id}")
     
     # Check if already exists
-    result = await db.execute(
+    result = db.execute(
         text("SELECT row_id FROM tbl_cp_m2m_std_interest WHERE student_id = :student_id AND interest_id = :interest_id"),
         {"student_id": student_id, "interest_id": interest_id}
     )
@@ -385,18 +385,18 @@ async def save_student_interest(db: AsyncSession, student_id: int, interest_id: 
         return {"already_exists": True}
     
     # Insert new relationship
-    await db.execute(
+    db.execute(
         text("""INSERT INTO tbl_cp_m2m_std_interest (student_id, interest_id)
                 VALUES (:student_id, :interest_id)"""),
         {"student_id": student_id, "interest_id": interest_id}
     )
-    await db.commit()
+    db.commit()
     logger.debug(f"Student interest saved")
     
     return {"already_exists": False}
 
 
-async def save_student_certification(db: AsyncSession, data: dict):
+def save_student_certification(db: Session, data: dict):
     """
     Saves a student-certification many-to-many relationship to tbl_cp_m2m_student_certification.
     
@@ -410,7 +410,7 @@ async def save_student_certification(db: AsyncSession, data: dict):
     logger.debug(f"Saving student certification: student_id={data.get('student_id')}, cert_id={data.get('certification_id')}")
     
     # Check if already exists
-    result = await db.execute(
+    result = db.execute(
         text("SELECT row_id FROM tbl_cp_m2m_student_certification WHERE student_id = :student_id AND certification_id = :certification_id"),
         {"student_id": data["student_id"], "certification_id": data["certification_id"]}
     )
@@ -424,7 +424,7 @@ async def save_student_certification(db: AsyncSession, data: dict):
     expiry_date = safe_date(data.get("expiry_date"), date(9999, 12, 31))
     
     # Insert new relationship
-    await db.execute(
+    db.execute(
         text("""INSERT INTO tbl_cp_m2m_student_certification 
                 (student_id, certification_id, issue_date, expiry_date, certificate_url, credential_id, is_verified)
                 VALUES (:student_id, :certification_id, :issue_date, :expiry_date, :certificate_url, :credential_id, :is_verified)"""),
@@ -438,13 +438,13 @@ async def save_student_certification(db: AsyncSession, data: dict):
             "is_verified": False
         }
     )
-    await db.commit()
+    db.commit()
     logger.debug(f"Student certification saved")
     
     return {"already_exists": False}
 
 
-async def save_address(db: AsyncSession, data: SaveAddressRequest) -> SaveAddressResponse:
+def save_address(db: Session, data: SaveAddressRequest) -> SaveAddressResponse:
     """
     Saves an address record to tbl_cp_student_address.
     
@@ -458,11 +458,11 @@ async def save_address(db: AsyncSession, data: SaveAddressRequest) -> SaveAddres
     logger.debug(f"Saving address for student: {data.student_id}")
     
     # Get next address_id
-    result = await db.execute(text("SELECT COALESCE(MAX(address_id), 0) + 1 FROM tbl_cp_student_address"))
+    result = db.execute(text("SELECT COALESCE(MAX(address_id), 0) + 1 FROM tbl_cp_student_address"))
     next_id = result.scalar()
     
     # Insert new address
-    await db.execute(
+    db.execute(
         text("""INSERT INTO tbl_cp_student_address 
                 (address_id, student_id, address_line_1, address_line_2, care_of, landmark, pincode_id, 
                  latitude, longitude, address_type, address_expiry)
@@ -482,7 +482,7 @@ async def save_address(db: AsyncSession, data: SaveAddressRequest) -> SaveAddres
             "address_expiry": '9999-12-31'
         }
     )
-    await db.commit()
+    db.commit()
     logger.debug(f"Address saved: {next_id}")
     
     return SaveAddressResponse(address_id=next_id)

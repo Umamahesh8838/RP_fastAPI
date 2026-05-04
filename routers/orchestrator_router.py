@@ -1,6 +1,6 @@
 from fastapi import APIRouter, UploadFile, File, Depends, Request, BackgroundTasks
 from fastapi.responses import StreamingResponse
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
 from sqlalchemy import text
 from database import get_db
 from schemas.common_schema import SuccessResponse, ErrorResponse
@@ -26,7 +26,7 @@ settings = get_settings()
     response_model=SuccessResponse,
     responses={400: {"model": ErrorResponse}, 413: {"model": ErrorResponse}}
 )
-async def upload_resume(file: UploadFile = File(...), db: AsyncSession = Depends(get_db)):
+async def upload_resume(file: UploadFile = File(...), db: Session = Depends(get_db)):
     """
     Complete resume upload and processing pipeline.
     Extracts text, parses with LLM, and fills the database.
@@ -67,7 +67,7 @@ async def upload_resume(file: UploadFile = File(...), db: AsyncSession = Depends
             )
         
         # Run full pipeline
-        result = await orchestrator_service.run_full_pipeline(db, file_bytes, file.filename)
+        result = orchestrator_service.run_full_pipeline(db, file_bytes, file.filename)
         
         return success_response(result)
         
@@ -83,7 +83,7 @@ async def upload_resume(file: UploadFile = File(...), db: AsyncSession = Depends
     response_model=SuccessResponse,
     responses={400: {"model": ErrorResponse}, 413: {"model": ErrorResponse}}
 )
-async def parse_resume_preview(file: UploadFile = File(...), db: AsyncSession = Depends(get_db)):
+async def parse_resume_preview(file: UploadFile = File(...), db: Session = Depends(get_db)):
     """
     Preview resume parsing without saving to database.
     Extracts text, checks for duplicates, and parses with LLM.
@@ -125,7 +125,7 @@ async def parse_resume_preview(file: UploadFile = File(...), db: AsyncSession = 
             )
         
         # Run parse preview (steps 1-3 only, no database save)
-        result = await orchestrator_service.parse_resume_preview(db, file_bytes, file.filename)
+        result = orchestrator_service.parse_resume_preview(db, file_bytes, file.filename)
         
         return success_response(result)
         
@@ -141,7 +141,7 @@ async def parse_resume_preview(file: UploadFile = File(...), db: AsyncSession = 
     responses={400: {"model": ErrorResponse}, 413: {"model": ErrorResponse}},
     summary="Parse resume with streaming progress (SSE)"
 )
-async def parse_with_progress(request: Request, file: UploadFile = File(...), db: AsyncSession = Depends(get_db)):
+async def parse_with_progress(request: Request, file: UploadFile = File(...), db: Session = Depends(get_db)):
     """
     Streams parsing progress updates via Server-Sent Events to avoid frontend timeouts.
     """
@@ -200,9 +200,9 @@ async def parse_with_progress(request: Request, file: UploadFile = File(...), db
 
                 await emit("progress", {"step": 2, "message": "Extracting text from document...", "percent": 10})
                 if file_ext == "pdf":
-                    extract_result = await extract_service.extract_text_from_pdf(file_bytes)
+                    extract_result = extract_service.extract_text_from_pdf(file_bytes)
                 elif file_ext == "docx":
-                    extract_result = await extract_service.extract_text_from_docx(file_bytes)
+                    extract_result = extract_service.extract_text_from_docx(file_bytes)
                 else:
                     await emit("error", {"message": "Unsupported file type"})
                     return
@@ -211,11 +211,7 @@ async def parse_with_progress(request: Request, file: UploadFile = File(...), db
 
                 await emit("progress", {"step": 3, "message": "Checking for duplicate resume...", "percent": 15})
                 resume_hash = compute_resume_hash(resume_text)
-                result = await db.execute(
-                    text("SELECT student_id FROM tbl_cp_resume_hashes WHERE hash = :hash"),
-                    {"hash": resume_hash}
-                )
-                existing_hash = result.fetchone()
+                existing_hash = orchestrator_service._find_existing_resume_hash(db, resume_hash)
                 already_exists = existing_hash is not None
 
                 cached = cache_utils.load_from_cache(resume_hash)
@@ -311,7 +307,7 @@ async def get_cached_resume(resume_hash: str):
     response_model=SuccessResponse,
     responses={400: {"model": ErrorResponse}}
 )
-async def save_confirmed_resume(request: SaveConfirmedRequest, db: AsyncSession = Depends(get_db)):
+async def save_confirmed_resume(request: SaveConfirmedRequest, db: Session = Depends(get_db)):
     """
     Save a confirmed/edited ParsedResume to the database.
     Called after user has reviewed the parsed data from /parse-preview.
@@ -332,7 +328,7 @@ async def save_confirmed_resume(request: SaveConfirmedRequest, db: AsyncSession 
             return error_response("parsed data is required", status_code=400)
         
         # Save confirmed resume (steps 4-15 of pipeline)
-        result = await orchestrator_service.save_confirmed_resume(
+        result = orchestrator_service.save_confirmed_resume(
             db, 
             request.resume_hash, 
             request.parsed
@@ -421,7 +417,7 @@ async def get_quality_score(resume_hash: str):
 async def bulk_upload_resumes(
     background_tasks: BackgroundTasks,
     files: list[UploadFile] = File(...),
-    db: AsyncSession = Depends(get_db)
+    db: Session = Depends(get_db)
 ):
     """
     Upload multiple resumes (max 10) for batch processing.

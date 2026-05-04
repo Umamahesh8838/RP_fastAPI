@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
 from database import get_db
 from fastapi import Depends
 from schemas.common_schema import SuccessResponse, ErrorResponse
@@ -38,7 +38,7 @@ async def parse_resume(request: ParseResumeRequest):
             )
         
         # Parse resume with LLM
-        parsed = await llm_service.parse_resume_text(request.resume_text)
+        parsed = llm_service.parse_resume_text(request.resume_text)
         
         # Compute hash
         resume_hash = compute_resume_hash(request.resume_text)
